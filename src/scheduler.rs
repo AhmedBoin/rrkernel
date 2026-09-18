@@ -1,0 +1,821 @@
+//! Scheduler policy: who runs next, what the counters say, and how a finished
+//! task's memory gets reclaimed.
+//!
+//! Everything in this module is backend-neutral. The port (see [`crate::arch`])
+//! only ever calls into [`schedule_next`], [`on_tick`] and [`record_latency`],
+//! and the ring surgery happens here — in Rust, under a critical section —
+//! rather than in hand-written assembly. That split is deliberate: assembly
+//! does register/stack mechanics, Rust does policy.
+
+use crate::arena::{Arena, ArenaStats, DEFAULT_ARENA};
+use crate::config::{ConfigError, PlatformLimits, Slice, SchedulerConfig};
+use crate::critical;
+use crate::ring;
+use crate::tcb::{KernelConfig, TaskControlBlock, TaskState, KERNEL};
+use core::cell::UnsafeCell;
+use core::ptr;
+
+/// Kernel arena. A private wrapper (rather than `static mut Arena`) so the
+/// `UnsafeCell` contract is explicit.
+struct ArenaCell(UnsafeCell<Arena>);
+
+// SAFETY: all access happens under `critical::enter`.
+unsafe impl Sync for ArenaCell {}
+
+static ARENA: ArenaCell = ArenaCell(UnsafeCell::new(Arena::empty()));
+
+/// Raw access to the kernel arena. Caller must hold a critical section.
+#[inline]
+pub(crate) unsafe fn arena() -> *mut Arena {
+    ARENA.0.get()
+}
+
+/// Snapshot of everything the kernel knows about itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedulerStats {
+    /// Tasks ever created (monotonic).
+    pub total_threads: usize,
+    /// Tasks currently linked in the ring.
+    pub active_threads: usize,
+    /// Slices elapsed since init.
+    pub ticks: u64,
+    /// Context switches performed since init.
+    pub switches: u64,
+    /// Timer ticks that could not be serviced in time (host contention).
+    pub ticks_deferred: u64,
+    /// Worst switch latency observed (timer cycles or ns; see `Measure`).
+    pub worst_latency: u32,
+    /// Most recent switch latency.
+    pub last_latency: u32,
+    /// Worst deviation of the achieved tick period from the requested slice
+    /// (nanoseconds). The headline timing number: how exact the slice is.
+    pub worst_period_error_ns: u32,
+    /// Most recent tick-period deviation (nanoseconds).
+    pub last_period_error_ns: u32,
+    /// Achieved slice length in nanoseconds.
+    pub slice_ns: u64,
+    /// Achieved slice length in timer cycles (0 on time-based host backends).
+    pub slice_cycles: u32,
+    /// Timer frequency used for the conversion (0 on host time-based timers).
+    pub timer_hz: u32,
+    /// Dead tasks whose memory has been reclaimed by deferred-free.
+    pub reclaimed: u64,
+    /// Arena usage.
+    pub arena: ArenaStats,
+    /// Whether the tick source is live.
+    pub running: bool,
+}
+
+/// Initialise the scheduler with the default configuration (1 ms slices).
+///
+/// The scheduler starts running **immediately**: the tick source is armed
+/// before this returns, and the calling context is adopted as task 0 and
+/// linked into the ring. There is no `scheduler_run()`.
+///
+/// # Panics
+/// Panics if the default 1 ms slice is not achievable on this platform. Use
+/// [`init_with`] if you want to handle that as a value.
+pub fn init() {
+    if let Err(e) = init_with(SchedulerConfig::default()) {
+        panic!("rrkernel: scheduler_init() failed: {}", e);
+    }
+}
+
+/// Initialise the scheduler with an explicit [`SchedulerConfig`].
+///
+/// `cfg.slice` is **the** tuning knob for timing-sensitive applications:
+/// `scheduler::init_with(SchedulerConfig::embedded(Slice::Micros(100),
+/// 168_000_000))` gives 100 µs slices, cycle-exact, on a 168 MHz core.
+pub fn init_with(cfg: SchedulerConfig) -> Result<(), ConfigError> {
+    // --- validate the time slice against the real platform -----------------
+    let plan = crate::arch::plan_timer(&cfg)?;
+    if plan.slice_ns == 0 || plan.slice_cycles == 0 {
+        return Err(ConfigError::ZeroSlice);
+    }
+
+    // --- arena -------------------------------------------------------------
+    let (base, len) = match cfg.arena {
+        Some(region) => (region.as_mut_ptr(), region.len()),
+        None => (DEFAULT_ARENA.as_ptr(), crate::arena::DEFAULT_ARENA_SIZE),
+    };
+    // The arena must at least hold task 0's TCB plus a few tasks' worth of
+    // bookkeeping. Bare metal also carves each task's *stack* from here (see
+    // `arch::cortex_m`), so the recommended size there is
+    // `stack_size * max_tasks`; OS-backed backends only need the TCBs and the
+    // closure blobs.
+    let min_arena = core::mem::size_of::<TaskControlBlock>() * 4 + 512;
+    if len < min_arena {
+        return Err(ConfigError::ArenaTooSmall {
+            provided: len,
+            minimum: min_arena,
+        });
+    }
+
+    let g = critical::enter();
+    unsafe {
+        if *KERNEL.running.get() {
+            return Err(ConfigError::AlreadyInitialized);
+        }
+
+        (*arena()).init(base, len);
+        *KERNEL.config.get() = KernelConfig {
+            stack_size: cfg.stack_size,
+            idle: cfg.idle,
+            measure: cfg.measure,
+            slice_cycles: plan.slice_cycles,
+            timer_hz: plan.timer_hz,
+            // Preserved from whatever `set_active_cores` chose before init, so the
+            // multi-core decision survives this snapshot.
+            active_cores: (*KERNEL.config.get()).active_cores.max(1),
+        };
+
+        // --- adopt the calling context as task 0 ---------------------------
+        let tcb = alloc_tcb().ok_or(ConfigError::ArenaTooSmall {
+            provided: len,
+            minimum: min_arena,
+        })?;
+        (*tcb).state = TaskState::Running;
+        (*tcb).id = take_id();
+        crate::arch::adopt_current_task(tcb)?;
+        ring::insert_after(ptr::null_mut(), tcb);
+        KERNEL.set_current(tcb);
+        *KERNEL.ring_head.get() = tcb;
+        *KERNEL.total_threads.get() = 1;
+        *KERNEL.active_threads.get() = 1;
+    }
+    drop(g);
+
+    // Arm the periodic tick source. From here on the CPU is time-sliced.
+    crate::arch::start_timer(plan)?;
+    let g = critical::enter();
+    unsafe { *KERNEL.running.get() = true };
+    drop(g);
+    Ok(())
+}
+
+/// Retune the slice at run time (reloads the timer; the *first* slice after
+/// the change is a full slice).
+pub fn set_slice(slice: Slice) -> Result<(), ConfigError> {
+    let g = critical::enter();
+    let timer_hz = unsafe {
+        if !*KERNEL.running.get() {
+            return Err(ConfigError::NotInitialized);
+        }
+        (*KERNEL.config.get()).timer_hz
+    };
+    drop(g);
+
+    let cfg = SchedulerConfig {
+        slice,
+        timer_hz,
+        ..SchedulerConfig::default()
+    };
+    let plan = crate::arch::plan_timer(&cfg)?;
+    crate::arch::retune_timer(plan)?;
+
+    let g = critical::enter();
+    unsafe {
+        (*KERNEL.config.get()).slice_cycles = plan.slice_cycles;
+        (*KERNEL.config.get()).timer_hz = plan.timer_hz;
+    }
+    drop(g);
+    Ok(())
+}
+
+/// What this platform can actually do. Call before choosing a slice.
+pub fn platform_limits() -> PlatformLimits {
+    crate::arch::platform_limits()
+}
+
+/// Current configuration snapshot (achieved slice, not the request).
+pub fn config() -> KernelConfig {
+    let g = critical::enter();
+    let c = unsafe { *KERNEL.config.get() };
+    drop(g);
+    c
+}
+
+/// Achieved slice length in nanoseconds.
+pub fn slice_ns() -> u64 {
+    let cycles = config().slice_cycles;
+    crate::arch::cycles_to_ns(cycles)
+}
+
+/// Full kernel statistics. Takes a critical section internally.
+pub fn stats() -> SchedulerStats {
+    let g = critical::enter();
+    let out = unsafe {
+        let cfg = *KERNEL.config.get();
+        SchedulerStats {
+            total_threads: *KERNEL.total_threads.get(),
+            active_threads: *KERNEL.active_threads.get(),
+            ticks: *KERNEL.ticks.get(),
+            switches: *KERNEL.switches.get(),
+            ticks_deferred: *KERNEL.ticks_deferred.get(),
+            worst_latency: *KERNEL.worst_latency.get(),
+            last_latency: *KERNEL.last_latency.get(),
+            worst_period_error_ns: *KERNEL.worst_period_error_ns.get(),
+            last_period_error_ns: *KERNEL.last_period_error_ns.get(),
+            slice_ns: crate::arch::cycles_to_ns(cfg.slice_cycles),
+            slice_cycles: cfg.slice_cycles,
+            timer_hz: cfg.timer_hz,
+            reclaimed: *KERNEL.reclaimed.get(),
+            arena: (*arena()).stats(),
+            running: *KERNEL.running.get(),
+        }
+    };
+    drop(g);
+    out
+}
+
+/// One row of [`for_each_task`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskInfo {
+    pub id: u32,
+    pub state: TaskState,
+    pub slices_run: u32,
+    pub switches: u32,
+    pub stack_size: usize,
+    /// True for the task currently owning the CPU.
+    pub is_current: bool,
+}
+
+/// Visit every task currently linked in the ring, in ring order.
+///
+/// Safe to call from a task (takes a critical section) but *not* from inside
+/// the switch path. The callback runs with preemption masked, so it must be
+/// short and must not spawn or sleep.
+pub fn for_each_task(mut f: impl FnMut(TaskInfo)) {
+    let g = critical::enter();
+    unsafe {
+        let cur = KERNEL.current();
+        // Iterate from the ring head so this also works in the window where a
+        // task has unlinked itself and no switch has happened yet.
+        let start = if cur.is_null() || !(*cur).is_linked() {
+            *KERNEL.ring_head.get()
+        } else {
+            cur
+        };
+        if !start.is_null() && (*start).is_linked() {
+            let mut p = start;
+            loop {
+                f(TaskInfo {
+                    id: (*p).id,
+                    state: (*p).state,
+                    slices_run: (*p).slices_run,
+                    switches: (*p).switches,
+                    stack_size: (*p).stack_size,
+                    is_current: p == cur,
+                });
+                p = (*p).next;
+                if p == start || p.is_null() {
+                    break;
+                }
+            }
+        }
+    }
+    drop(g);
+}
+
+/// Number of tasks linked in the ring.
+pub fn active_threads() -> usize {
+    let g = critical::enter();
+    let n = unsafe { *KERNEL.active_threads.get() };
+    drop(g);
+    n
+}
+
+/// Total tasks ever created.
+pub fn total_threads() -> usize {
+    let g = critical::enter();
+    let n = unsafe { *KERNEL.total_threads.get() };
+    drop(g);
+    n
+}
+
+/// Id of the currently running task (0 if none).
+pub fn current_task_id() -> u32 {
+    let g = critical::enter();
+    let id = unsafe {
+        let c = KERNEL.current();
+        if c.is_null() {
+            0
+        } else {
+            (*c).id
+        }
+    };
+    drop(g);
+    id
+}
+
+/// Slices handed to the **calling task** so far. Cheap way for a task to see
+/// its own share and, together with its siblings, to demonstrate that pure
+/// round-robin fairness holds.
+pub fn current_slices_run() -> u32 {
+    let g = critical::enter();
+    let n = unsafe {
+        let c = KERNEL.current();
+        if c.is_null() {
+            0
+        } else {
+            (*c).slices_run
+        }
+    };
+    drop(g);
+    n
+}
+
+/// Number of context switches performed so far (cheap, lock-free read of the
+/// 64-bit counter). Useful for correlating a task's timeline with the
+/// scheduler's own rotation.
+pub fn switch_count() -> u64 {
+    let g = critical::enter();
+    let n = unsafe { *KERNEL.switches.get() };
+    drop(g);
+    n
+}
+
+/// Number of slices elapsed so far.
+pub fn tick_count() -> u64 {
+    let g = critical::enter();
+    let n = unsafe { *KERNEL.ticks.get() };
+    drop(g);
+    n
+}
+
+/// Ask the kernel to stop: on the host this exits the process, on bare metal
+/// it masks interrupts and parks forever. Never returns.
+pub fn shutdown(code: i32) -> ! {
+    let g = critical::enter();
+    unsafe { *KERNEL.shutdown.get() = true };
+    drop(g);
+    crate::arch::shutdown(code)
+}
+
+/// Set the shutdown flag without exiting (the host tick thread will notice and
+/// terminate the process; useful for cooperative tear-down in tests).
+pub fn request_shutdown() {
+    let g = critical::enter();
+    unsafe { *KERNEL.shutdown.get() = true };
+    drop(g);
+    crate::arch::request_switch();
+}
+
+/// True once [`request_shutdown`] / [`shutdown`] has been called.
+pub fn shutdown_requested() -> bool {
+    let g = critical::enter();
+    let b = unsafe { *KERNEL.shutdown.get() };
+    drop(g);
+    b
+}
+
+/// Run the rest of `main` as **task 0's body**, then treat its return as a task
+/// exit (unlink, `active_threads -= 1`, immediate switch) instead of falling
+/// back into the C runtime.
+///
+/// # Why this exists
+/// `scheduler_init()` adopts the calling context as task 0 — but on a hosted
+/// process, *returning from `main`* is not something the kernel can intercept:
+/// the C runtime takes over and calls `exit()`, which would tear the whole
+/// process (and every task with it) down. `main_body` closes that hole without
+/// any stack surgery: it calls `f`, and on return it runs the very same
+/// teardown a task trampoline runs, ending the calling thread through the
+/// kernel's own exit path (`ExitThread` on Windows, the idle loop on bare
+/// metal) instead of the CRT's `exit()`.
+///
+/// Usage — spec semantics, host and metal alike:
+///
+/// ```no_run
+/// # use rrkernel::{scheduler, thread, Slice, SchedulerConfig};
+/// fn main() {
+///     scheduler::init_with(SchedulerConfig::embedded(Slice::Millis(1), 168_000_000)).unwrap();
+///     scheduler::main_body(|| {
+///         thread::spawn(|| loop { /* CPU-bound, preempted every slice */ });
+///         thread::spawn(|| { /* short work, then returns -> auto unlink */ });
+///     });
+/// }
+/// ```
+///
+/// # Panics
+/// Panics if the scheduler has not been initialised.
+pub fn main_body<F: FnOnce()>(f: F) -> ! {
+    // The scheduler adopted the calling context as task 0 at init time, so the
+    // current TCB *is* our task (which stays true across preemptions: a task is
+    // only ever running while it is the current one).
+    let me = {
+        let g = critical::enter();
+        let me = unsafe { KERNEL.current() };
+        drop(g);
+        assert!(
+            !me.is_null(),
+            "scheduler::main_body() requires scheduler::init*() to have run first"
+        );
+        me
+    };
+
+    f();
+
+    // SAFETY: we are this task, and its body has returned.
+    unsafe { crate::trampoline::exit_task(me) }
+}
+
+// ---------------------------------------------------------------------------
+// Called by the ports
+// ---------------------------------------------------------------------------
+
+/// Pick the next runnable task and hand it the CPU. **Runs in kernel context**
+/// (Cortex-M: inside PendSV, on the kernel/main stack; host: on the tick
+/// thread's stack), which is what makes it safe to reclaim the memory of the
+/// task we just switched away from.
+///
+/// Returns the TCB to switch to, or null when nothing is runnable.
+///
+/// # Safety
+/// Must be called from the port's switch path with the ring quiescent.
+pub unsafe fn schedule_next() -> *mut TaskControlBlock {
+    let mut cur = KERNEL.current();
+    if !cur.is_null() && !(*cur).is_linked() {
+        // The current task finished and unlinked itself; it is only waiting
+        // for the port to switch away from it.
+        cur = ptr::null_mut();
+        KERNEL.set_current(ptr::null_mut());
+    }
+
+    let next = if cur.is_null() {
+        *KERNEL.ring_head.get()
+    } else {
+        ring::next_runnable(cur)
+    };
+
+    if next.is_null() || !(*next).is_linked() {
+        // Nothing runnable at all: leave `current` alone, the port's idle path
+        // decides what to do (wfi / sleep / exit).
+        return ptr::null_mut();
+    }
+
+    if next != cur {
+        if !cur.is_null() && (*cur).state == TaskState::Running {
+            (*cur).state = TaskState::Ready;
+        }
+        (*next).state = TaskState::Running;
+        KERNEL.set_current(next);
+        *KERNEL.switches.get() += 1;
+    }
+    (*next).switches = (*next).switches.wrapping_add(1);
+    (*next).slices_run = (*next).slices_run.wrapping_add(1);
+    next
+}
+
+/// A timer tick fired. The port calls this before asking for a switch.
+#[inline]
+pub unsafe fn on_tick() {
+    *KERNEL.ticks.get() += 1;
+    // Wake anything whose bounded wait has expired. This is also what makes
+    // `Mutex::try_lock_for` time out: the waiter is asleep on a deadline and the tick
+    // is the only clock that can notice it passing.
+    wake_expired();
+}
+
+/// A tick could not be serviced (host lock contention). Visible in
+/// [`SchedulerStats::ticks_deferred`]; a non-zero and growing value means the
+/// slice is too short for the host scheduler to honour it.
+#[inline]
+pub unsafe fn on_tick_deferred() {
+    *KERNEL.ticks_deferred.get() += 1;
+}
+
+/// Record switch latency (`Measure::Cycles` / `Measure::Nanos`, whichever the
+/// port produced).
+#[inline]
+pub unsafe fn record_latency(value: u32) {
+    *KERNEL.last_latency.get() = value;
+    if value > *KERNEL.worst_latency.get() {
+        *KERNEL.worst_latency.get() = value;
+    }
+}
+
+/// Record how far the achieved tick period deviated from the requested slice
+/// (nanoseconds, absolute value). This is the kernel's timing-accuracy metric:
+/// on bare metal it is a handful of cycles, on a desktop OS it is what the host
+/// timer allows.
+#[inline]
+pub unsafe fn record_period_error(value: u32) {
+    *KERNEL.last_period_error_ns.get() = value;
+    if value > *KERNEL.worst_period_error_ns.get() {
+        *KERNEL.worst_period_error_ns.get() = value;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Allocation, reclamation and spawn (internal)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Blocking: sleeping `Mutex` waits and bounded sleeps
+// ---------------------------------------------------------------------------
+//
+// A task that blocks stays **linked** in the ring and is simply skipped by
+// `ring::next_runnable`, which is what makes both blocking and waking O(1) — nothing has
+// to be searched to put it back, and its place in the rotation is preserved.
+
+/// Mark the calling task blocked on `resource` and ask for an immediate switch.
+///
+/// `resource` is a [`crate::sync::LockId`], or 0 for a plain bounded sleep.
+/// `deadline_tick` is an absolute slice-tick count (0 = wait indefinitely).
+///
+/// This is the O(1) heart of `Mutex::lock`: the caller leaves the CPU at once instead of
+/// spinning through its slice. The switch is *requested* rather than performed here, so
+/// the caller is guaranteed to be off the CPU before it next runs — on bare metal the
+/// pending interrupt is taken the moment the critical section ends.
+pub fn block_current(resource: u32, deadline_tick: u64) {
+    {
+        let g = critical::enter();
+        unsafe {
+            let me = KERNEL.current();
+            if me.is_null() {
+                return;
+            }
+            (*me).blocked_on = resource;
+            (*me).block_deadline = deadline_tick;
+            (*me).state = TaskState::Blocked;
+        }
+        drop(g);
+    }
+    crate::arch::request_switch();
+}
+
+/// Sleep for at least `ticks` slice ticks (the only clock the kernel has).
+pub fn sleep_ticks(ticks: u64) {
+    let deadline = unsafe { *KERNEL.ticks.get() }.wrapping_add(ticks);
+    block_current(0, deadline);
+}
+
+/// Make every task blocked on `resource` runnable again. O(ring).
+///
+/// Called by `Mutex::unlock`. A per-lock waiter list would make this O(waiters) at the
+/// cost of another intrusive link in every TCB; at the task counts this kernel targets
+/// the ring walk is the cheaper trade, and the *context switch* it triggers is O(1).
+pub fn wake_blocked_on(resource: u32) {
+    let g = critical::enter();
+    unsafe {
+        let head = *KERNEL.ring_head.get();
+        if !head.is_null() {
+            let mut p = head;
+            loop {
+                if (*p).state == TaskState::Blocked && (*p).blocked_on == resource {
+                    (*p).state = TaskState::Ready;
+                    (*p).blocked_on = 0;
+                    (*p).block_deadline = 0;
+                }
+                p = (*p).next;
+                if p.is_null() || p == head {
+                    break;
+                }
+            }
+        }
+    }
+    drop(g);
+}
+
+/// Wake tasks whose bounded wait has expired.
+///
+/// # Safety
+/// Called from the tick path, with preemption masked.
+unsafe fn wake_expired() {
+    let now = *KERNEL.ticks.get();
+    let head = *KERNEL.ring_head.get();
+    if head.is_null() {
+        return;
+    }
+    let mut p = head;
+    loop {
+        if (*p).state == TaskState::Blocked && (*p).block_deadline != 0 && now >= (*p).block_deadline
+        {
+            (*p).state = TaskState::Ready;
+            (*p).blocked_on = 0;
+            (*p).block_deadline = 0;
+        }
+        p = (*p).next;
+        if p.is_null() || p == head {
+            break;
+        }
+    }
+}
+
+/// Number of tasks currently blocked (waiting for a lock, or sleeping).
+pub fn blocked_threads() -> usize {
+    let g = critical::enter();
+    let mut n = 0usize;
+    unsafe {
+        let head = *KERNEL.ring_head.get();
+        if !head.is_null() {
+            let mut p = head;
+            loop {
+                if (*p).state == TaskState::Blocked {
+                    n += 1;
+                }
+                p = (*p).next;
+                if p.is_null() || p == head {
+                    break;
+                }
+            }
+        }
+    }
+    drop(g);
+    n
+}
+
+/// Set how many cores run the scheduler (validated against the target's maximum).
+///
+/// Cores at or above `n` park in a low-power wait loop instead of pulling tasks.
+pub fn set_active_cores(n: usize) -> Result<(), ConfigError> {
+    let max = crate::smp::max_cores().max(1);
+    if n == 0 || n > max {
+        return Err(ConfigError::Platform(
+            "active_cores outside 1..=smp::max_cores() for this target",
+        ));
+    }
+    if n > 1 && !crate::smp::supports_smp() {
+        return Err(ConfigError::Platform(
+            "this target has no cross-core interlock, so it cannot run more than one core",
+        ));
+    }
+    let g = critical::enter();
+    unsafe { (*KERNEL.config.get()).active_cores = n };
+    drop(g);
+    Ok(())
+}
+
+/// How many cores are running the scheduler.
+pub fn active_cores() -> usize {
+    let g = critical::enter();
+    let n = unsafe { (*KERNEL.config.get()).active_cores };
+    drop(g);
+    n
+}
+
+/// Allocate and zero a TCB from the kernel arena. Caller holds a critical
+/// section.
+pub(crate) unsafe fn alloc_tcb() -> Option<*mut TaskControlBlock> {
+    let p = (*arena()).alloc(
+        core::mem::size_of::<TaskControlBlock>(),
+        core::mem::align_of::<TaskControlBlock>(),
+    )? as *mut TaskControlBlock;
+    ptr::write_bytes(p as *mut u8, 0, core::mem::size_of::<TaskControlBlock>());
+    Some(p)
+}
+
+/// Hand out the next task id.
+pub(crate) unsafe fn take_id() -> u32 {
+    let id = *KERNEL.next_id.get();
+    *KERNEL.next_id.get() = id.wrapping_add(1);
+    id
+}
+
+/// Kernel-context reclamation of finished tasks.
+///
+/// A returning task cannot unmap the stack it is still standing on, so
+/// `task_exit` only *unlinks* and pushes itself onto `pending_free`. This
+/// function — which must run in a context that is **not** on the finished task's
+/// stack — performs the actual `Arena::free` calls. That is what keeps
+/// `active_threads`, the ring and the arena consistent with each other: dead
+/// nodes leave the ring in O(1), their memory is recycled soon after, and
+/// repeated spawn/exit is steady-state.
+///
+/// # Where each port calls it
+/// * **Cortex-M** — from `PendSV`, which runs on MSP (the kernel stack): called
+///   *before* the switch, which is safe because the dying task's PSP stack is
+///   not where the handler is running.
+/// * **Win32** — from the tick thread, before the switch. `is_pinned` keeps the
+///   TCB the tick thread still needs from being recycled underneath it.
+/// * **POSIX fibres** — *after* the switch (the handler shares the interrupted
+///   fibre's stack, so the dying stack must not be released from inside it; the
+///   next handler invocation runs on a different fibre's stack).
+///
+/// # Safety
+/// Kernel context, with the kernel lock/critical section held.
+pub unsafe fn reclaim_finished_tasks() {
+    let mut node = *KERNEL.pending_free.get();
+    *KERNEL.pending_free.get() = ptr::null_mut();
+
+    let ar = &mut *arena();
+    while !node.is_null() {
+        // `prev` doubles as the deferred-free list link for a dead TCB.
+        let next = (*node).prev;
+
+        debug_assert!(!(*node).is_linked(), "dead task still linked in the ring");
+        debug_assert_eq!((*node).state, TaskState::Dead);
+
+        if crate::arch::is_pinned(node) {
+            // The port still needs this TCB — typically because it is the task
+            // the tick thread has just taken the CPU away from, and its backend
+            // resources (Win32 thread handle, fiber stack) must stay valid until
+            // that switch has fully completed. Re-queue it for the next drain;
+            // this pins at most one node, so the list stays bounded.
+            (*node).prev = *KERNEL.pending_free.get();
+            *KERNEL.pending_free.get() = node;
+            node = next;
+            continue;
+        }
+
+        // Let the backend release its own resources (Win32 thread handle, ...)
+        // before the TCB itself is recycled.
+        crate::arch::on_task_reclaimed(node);
+
+        ar.free((*node).closure_block);
+        ar.free((*node).stack_base);
+        let n = node;
+        node = next;
+        ar.free(n as *mut u8);
+
+        *KERNEL.reclaimed.get() += 1;
+    }
+}
+
+/// Push a finished task onto the deferred-free list. Called by the trampoline
+/// from the dying task's own context, with the ring already unlinked and the
+/// counters already decremented.
+///
+/// # Safety
+/// Critical section held; `tcb` must be unlinked and marked `Dead`.
+pub(crate) unsafe fn push_pending_free(tcb: *mut TaskControlBlock) {
+    (*tcb).prev = *KERNEL.pending_free.get();
+    *KERNEL.pending_free.get() = tcb;
+}
+
+/// Bodies of `thread::spawn*`. Takes the critical section itself.
+pub(crate) unsafe fn spawn_internal<F>(f: F, stack_size: usize) -> Result<(), crate::SpawnError>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let g = critical::enter();
+
+    let ar = arena();
+    if !(*ar).is_ready() {
+        drop(g);
+        return Err(crate::SpawnError::NotInitialized);
+    }
+
+    // 1. TCB.
+    let tcb = match alloc_tcb() {
+        Some(t) => t,
+        None => {
+            drop(g);
+            return Err(crate::SpawnError::ArenaExhausted);
+        }
+    };
+
+    // 2. Closure blob (the *task body*), placed without any heap.
+    let csize = crate::closure::block_size_for::<F>();
+    let calign = crate::closure::block_align_for::<F>();
+    let blob = match (*arena()).alloc(csize, calign) {
+        Some(b) => b,
+        None => {
+            (*arena()).free(tcb as *mut u8);
+            drop(g);
+            return Err(crate::SpawnError::ArenaExhausted);
+        }
+    };
+    crate::closure::place::<F>(blob, f);
+    (*tcb).closure_block = blob;
+
+    (*tcb).id = take_id();
+    (*tcb).state = TaskState::Ready;
+    (*tcb).slices_run = 0;
+    (*tcb).switches = 0;
+
+    // 3. Backend-specific: stack, initial register frame, thread/fiber.
+    if let Err(e) = crate::arch::create_task(tcb, stack_size) {
+        crate::closure::drop_blob::<F>(blob);
+        (*arena()).free(blob);
+        (*arena()).free(tcb as *mut u8);
+        drop(g);
+        return Err(e);
+    }
+
+    // 4. Link into the live ring, *after* the current task: the newcomer runs
+    //    immediately next, instead of waiting a whole lap.
+    let cur = KERNEL.current();
+    crate::ring::insert_after(cur, tcb);
+    if cur.is_null() {
+        (*tcb).state = TaskState::Running;
+        KERNEL.set_current(tcb);
+    }
+    *KERNEL.ring_head.get() = tcb;
+    *KERNEL.total_threads.get() += 1;
+    *KERNEL.active_threads.get() += 1;
+
+    debug_assert!(crate::ring::check(KERNEL.current()).is_ok());
+
+    // 5. Register the newcomer instantly: kick the switch path and restart the
+    //    slice counter, so the new task gets a full, unreserved slice.
+    if *KERNEL.running.get() {
+        crate::arch::request_switch();
+        // On bare metal the pending PendSV fires as soon as this critical
+        // section exits; on the host the tick thread wakes (blocking on the
+        // kernel lock until we drop it) and performs the switch plus the tick
+        // reset.
+    }
+    drop(g);
+    Ok(())
+}

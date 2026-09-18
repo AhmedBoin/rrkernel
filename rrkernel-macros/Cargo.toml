@@ -1,0 +1,18 @@
+[package]
+name = "rrkernel-macros"
+version = "0.2.0"
+edition = "2021"
+description = "Attribute macros for rrkernel: #[rrkernel] turns a cortex-m-rt entry point into task 0, configures nothing you did not ask for, and installs the kernel's fault and panic handlers."
+license = "MIT"
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+# Host-only, build-time dependencies: they run in the compiler, never on the target, so
+# they add nothing to the image. The kernel itself stays dependency-free when built with
+# `default-features = false`.
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

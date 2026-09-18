@@ -1,0 +1,90 @@
+# Cargo configuration for the rrkernel workspace.
+#
+# ---------------------------------------------------------------------------
+# 1. Host (Windows/MSVC) linker
+# ---------------------------------------------------------------------------
+# `link.exe` is only on PATH inside a Visual Studio Developer prompt. This
+# machine has VS 2026 Community + Windows SDK 10.0.28000.0, plus LLVM's
+# `lld-link.exe`, so we point rustc straight at LLVM's MSVC linker and give it
+# the three LIBPATHs it needs (MSVC CRT + UCRT + UM).
+#
+# If you move this repo to another machine, regenerate the two version
+# directories:
+#   & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" `
+#       -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+#       -property installationPath
+#   Get-ChildItem "<vs>\VC\Tools\MSVC"            # MSVC toolset version
+#   Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib"   # SDK version
+#
+# Alternatively: delete this file, run everything from a Developer prompt, or
+# set the env var CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER.
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link.exe"
+rustflags = [
+    "-Clink-arg=/LIBPATH:C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\MSVC\\14.51.36231\\lib\\x64",
+    "-Clink-arg=/LIBPATH:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.28000.0\\ucrt\\x64",
+    "-Clink-arg=/LIBPATH:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.28000.0\\um\\x64",
+]
+
+# ---------------------------------------------------------------------------
+# 2. Bare metal targets
+# ---------------------------------------------------------------------------
+# These targets already default to the bundled `rust-lld` (see
+# `rustc --print target-spec-json -Z unstable-options --target thumbv7m-none-eabi`),
+# so no external toolchain is required.
+#
+# The linker script is NOT passed here: each firmware crate supplies `-Tlink.x`
+# itself through `cargo:rustc-link-arg` in its build.rs. Adding it in both places
+# makes rust-lld see `-Tlink.x` twice, and the second pass redefines MEMORY
+# regions ("region 'FLASH' already defined").
+
+# ---------------------------------------------------------------------------
+# 3. QEMU runners (what `cargo run --target ...` uses)
+# ---------------------------------------------------------------------------
+# Every runner forwards the guest's exit status, so the demo's verdict becomes
+# the command's exit code and the whole thing can be used in CI.
+
+[target.riscv32imac-unknown-none-elf]
+# `-bios none` is essential: it keeps QEMU from running OpenSBI first, so the
+# firmware starts in machine mode at its own entry point.
+runner = "qemu-system-riscv32 -M virt -cpu rv32 -bios none -nographic -no-reboot -kernel"
+
+[target.armv7a-none-eabi]
+# `secure=off` is essential: the physical timer's interrupt (PPI 30) is a
+# non-secure interrupt, and a GICv2 will not deliver a group-1 interrupt to a
+# *secure* CPU. `-M virt` otherwise boots into secure EL1 with no secure monitor
+# around, which yields an interrupt that is enabled, pending and never delivered.
+# `-semihosting` lets the firmware ask QEMU to exit with the demo's verdict as the
+# process exit code.
+runner = "qemu-system-arm -M virt,secure=off -cpu cortex-a15 -nographic -no-reboot -semihosting -kernel"
+
+[target.thumbv6m-none-eabi]
+runner = "qemu-system-arm -M microbit -nographic -kernel"
+
+[target.xtensa-esp32-none-elf]
+# Two things make Xtensa different from every other bare-metal target here:
+#
+# 1. the linker is Espressif's GCC driver, because rust-lld (even the esp-rs fork's,
+#    LLD 21.1.3) refuses `-m elf32xtensa` ("unknown emulation"). `espup install`
+#    puts it here; adjust the path if your toolchain lives elsewhere.
+# 2. the runner is Espressif's QEMU fork: upstream QEMU has no ESP32 machine at all
+#    (`qemu-system-xtensa -cpu esp32` is an error there). The `-global` disables the
+#    emulated Timer Group watchdog, which is enabled at reset and would otherwise
+#    reset the guest in the middle of the demo.
+linker = "C:/Users/Mohamed/.rustup/toolchains/esp/xtensa-esp-elf/bin/xtensa-esp32-elf-gcc.exe"
+# `-windowed` is deliberate: the kernel's trap path runs with `EXCM = 1`, which the
+# ISA gives no way to clear (only `rfi`/`rfe` do), and a window-rotating call in that
+# state raises an Alloca exception instead of spilling. Compiling with the call0 ABI
+# means no `entry`/`call4` ever needs a window, which is exactly what the canonical
+# Xtensa low-level code does (see `__XTENSA_CALL0_ABI__` in ESP-IDF's vectors.S).
+rustflags = [
+    "-C", "target-feature=-windowed",
+    "-C", "link-arg=-nostartfiles",
+    "-C", "link-arg=-Wl,--gc-sections",
+]
+runner = 'tools/qemu-esp32/qemu/bin/qemu-system-xtensa.exe -nographic -machine esp32 -global driver=timer.esp32.timg,property=wdt_disable,value=true -kernel'
+
+[alias]
+# Convenience aliases (run from the workspace root).
+host = "test --features std"
+fw = "build -p firmware-cortex-m --target thumbv7m-none-eabi --release"

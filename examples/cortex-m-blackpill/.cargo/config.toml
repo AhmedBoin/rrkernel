@@ -1,0 +1,15 @@
+[target.thumbv7em-none-eabi]
+# `cargo run` from this directory flashes, runs and attaches to RTT.
+#
+# CHIP: verified on the connected part as STM32F401CD/E (DBGMCU_IDCODE = 0x10016433). If
+# probe-rs complains, list the family and pick yours:
+#     probe-rs chip list | Select-String STM32F401
+runner = "probe-rs run --chip STM32F401CE"
+# `cortex-m-rt` ships `link.x`, which `INCLUDE`s our `memory.x`.
+rustflags = ["-C", "link-arg=-Tlink.x"]
+
+[build]
+# Soft-float on purpose: the kernel's Cortex-M port saves no FPU registers (lazy stacking
+# is disabled to make a stack switch safe), so a hard-float build could corrupt a task that
+# uses floating point. Nothing here needs the FPU.
+target = "thumbv7em-none-eabi"

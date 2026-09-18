@@ -1,0 +1,22 @@
+[package]
+name = "cortex-m-bluepill"
+version = "0.1.0"
+edition = "2021"
+description = "rrkernel in a plain cortex-m-rt application (STM32F103C8 'Blue Pill'), with RTT output over the debug probe."
+license = "MIT"
+publish = false
+
+[dependencies]
+# The kernel. A path dependency like any other crate; it stays zero-dependency itself
+# (all of the ecosystem crates below belong to *this application*, not to the kernel).
+rrkernel = { path = "../.." }
+
+# The normal Cortex-M stack, exactly as you would use on any other project. Note there is
+# no `panic-halt`: `rrkernel::app!` installs the panic handler.
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+rtt-target = "0.6"
+
+# `#[cortex_m_rt::entry]` comes from `cortex-m-rt`; its weak default handlers for
+# `SysTick` and `PendSV` are overridden by the kernel's own strong definitions, which
+# is the whole integration.

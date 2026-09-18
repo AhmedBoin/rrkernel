@@ -1,0 +1,22 @@
+[package]
+name = "cortex-m-blackpill"
+version = "0.1.0"
+edition = "2021"
+description = "rrkernel on an STM32F401 'Black Pill': the LED driven through stm32f4xx-hal in one thread, RTT debug output from another."
+license = "MIT"
+publish = false
+
+[dependencies]
+# The kernel, exactly as any other project would use it.
+rrkernel = { path = "../.." }
+
+# The HAL, as any STM32F4 project would use it. `stm32f401` is the family this chip
+# belongs to: DEV_ID 0x433 read from DBGMCU_IDCODE says F401xD/E (512K flash, 96K RAM).
+stm32f4xx-hal = { version = "0.23", features = ["stm32f401"] }
+embedded-hal = "1.0"
+
+# `cortex-m` is required by `#[rrkernel]` (it masks interrupts through it) and its
+# `critical-section-single-core` feature is what `rtt-target` links against.
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+rtt-target = "0.6"

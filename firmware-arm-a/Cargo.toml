@@ -1,0 +1,11 @@
+[package]
+name = "firmware-arm-a"
+version = "0.2.0"
+edition = "2021"
+description = "rrkernel on ARM A/R profile (ARMv7-A/R, SVC-mode tasks, generic timer + GICv2), for QEMU -M virt -cpu cortex-a15 and for Cortex-R parts."
+license = "MIT"
+publish = false
+
+[dependencies]
+rrkernel = { path = "..", default-features = false }
+rrkernel-demo = { path = "../firmware-common" }

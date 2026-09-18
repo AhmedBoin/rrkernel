@@ -1,0 +1,6 @@
+# Keep shell scripts LF even on Windows checkouts: bash refuses CRLF
+# ("set: pipefail: invalid option name") and the failure mode is confusing.
+*.sh text eol=lf
+
+# Linker scripts and assembly are line-oriented too.
+*.x text eol=lf

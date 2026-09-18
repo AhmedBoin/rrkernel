@@ -1,0 +1,14 @@
+[package]
+name = "firmware-riscv"
+version = "0.2.0"
+edition = "2021"
+description = "rrkernel on RISC-V 32 (RV32IMAC) machine mode, for QEMU -M virt / sifive_e / spike."
+license = "MIT"
+publish = false
+
+[dependencies]
+rrkernel = { path = "..", default-features = false }
+rrkernel-demo = { path = "../firmware-common" }
+
+# NOTE: no `[profile.*]` here on purpose — this crate is a workspace member, so
+# the workspace root's profiles apply.

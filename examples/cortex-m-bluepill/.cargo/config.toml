@@ -1,0 +1,11 @@
+[target.thumbv7m-none-eabi]
+# `cargo run` (from this directory) flashes and runs, and `probe-rs run` attaches to
+# RTT, so every `rprintln!` shows up in the terminal.
+runner = "probe-rs run --chip STM32F103C8"
+# `cortex-m-rt` ships `link.x`; it `INCLUDE`s our `memory.x`, which the build script
+# puts on the linker's search path.
+rustflags = ["-C", "link-arg=-Tlink.x"]
+
+[build]
+# So `cargo build` / `cargo run` in this directory need no `--target`.
+target = "thumbv7m-none-eabi"

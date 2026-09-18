@@ -1,0 +1,14 @@
+[package]
+name = "firmware-cortex-m"
+version = "0.2.0"
+edition = "2021"
+description = "Bare-metal rrkernel demo: SysTick + PendSV preemptive round robin on Cortex-M."
+license = "MIT"
+publish = false
+
+[dependencies]
+rrkernel = { path = "..", default-features = false }
+
+# NOTE: no `[profile.*]` here on purpose — this crate is a workspace member, so
+# the workspace root's profiles apply (that is where `panic = "abort"` and the
+# size/speed settings live for the whole project).

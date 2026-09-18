@@ -1,0 +1,13 @@
+/target
+
+# Local tooling: Espressif's QEMU (the only QEMU with the ESP32/ESP32-C3
+# machines) and the reference files used while porting. Re-downloadable; see
+# docs/ESP32.md.
+# Per-target logs captured by the project (QEMU runs, probes, bring-up sessions).
+# None of these are sources: they are diagnostics, and QEMU `-d` logs run to hundreds
+# of megabytes.
+/tools
+*.log
+*.txt
+!Cargo.lock
+

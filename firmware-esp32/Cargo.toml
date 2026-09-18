@@ -1,0 +1,18 @@
+[package]
+name = "firmware-esp32"
+version = "0.2.0"
+edition = "2021"
+description = "rrkernel on the classic ESP32 (Xtensa LX6, dual-core), for Espressif's QEMU -M esp32."
+license = "MIT"
+publish = false
+
+[dependencies]
+rrkernel = { path = "..", default-features = false }
+rrkernel-demo = { path = "../firmware-common" }
+
+# NOTE: no `[profile.*]` here on purpose — this crate is a workspace member, so the
+# workspace root's profiles apply.
+
+# Built with the esp-rs toolchain (see docs/ESP32.md):
+#   rustup run esp cargo build -p firmware-esp32 -Zbuild-std=core --release \
+#       --target xtensa-esp32-none-elf

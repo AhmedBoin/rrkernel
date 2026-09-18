@@ -1,0 +1,14 @@
+[package]
+name = "rrkernel-demo"
+version = "0.2.0"
+edition = "2021"
+description = "The rrkernel bare-metal demo, written once for every supported architecture (AVR, Cortex-M, Cortex-R/A, RISC-V, Xtensa)."
+license = "MIT"
+publish = false
+
+[lib]
+name = "rrkernel_demo"
+path = "src/lib.rs"
+
+[dependencies]
+rrkernel = { path = "..", default-features = false }
