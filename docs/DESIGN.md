@@ -25,7 +25,7 @@ Requirements, and how each one is met:
 ```rust
 #[repr(C)]
 pub struct TaskControlBlock {
-    pub sp: *mut u8,             // offset 0 — read by PendSV with a literal offset
+    pub sp: *mut u8,             // offset 0 read by PendSV with a literal offset
     pub stack_base: *mut u8,
     pub stack_size: usize,
     pub closure_block: *mut u8,  // the task body: [header | FnOnce], arena-allocated
@@ -47,7 +47,7 @@ offsets (§6 shows the generated `ldrb r2, [r0, #17]`).
 
 ### Kernel control state
 
-`#[no_mangle] pub static KERNEL: Kernel` — one `UnsafeCell` per field, so
+`#[no_mangle] pub static KERNEL: Kernel` one `UnsafeCell` per field, so
 `current_tcb` sits at offset 0 (the `PendSV` literal) and `offset_of!` can assert
 it. Fields: `current_tcb`, `ring_head`, `total_threads`, `active_threads`,
 `ticks`, `switches`, `ticks_deferred`, `worst_latency`, `last_latency`,
@@ -95,13 +95,13 @@ Two details matter, and both were bugs at some point:
    a register (Cortex-M `R0`, x86-64 `r12`, Win32 thread parameter).
 2. **Deferred reclamation.** A task cannot free the stack it is standing on, so
    `exit_task` only unlinks and queues itself;
-   `scheduler::reclaim_finished_tasks` — running in a context that is *not* on
-   that stack — does the `Arena::free` calls. Where "not on that stack" is
+   `scheduler::reclaim_finished_tasks` running in a context that is *not* on
+   that stack does the `Arena::free` calls. Where "not on that stack" is
    differs per backend (§5), and on POSIX it is *after* the switch, not before.
 
 ## 4. Slice timing: the part that makes it real-time
 
-Every backend re-arms or restarts the timer **on every switch** — the "reset the
+Every backend re-arms or restarts the timer **on every switch** the "reset the
 interrupt counter so the next task gets a full slice" requirement. A task that
 exits early, or a spawn that kicks the scheduler, therefore never shortens
 anybody's slice, and the period cannot drift.
@@ -123,7 +123,7 @@ Timing accuracy is measured, not asserted:
 * Cortex-M: `DWT->CYCCNT` sampled in `SysTick_Handler` (period error) and around
   the Rust half of the switch (service time). Cores without `DWT` (M0/M0+) are
   detected at runtime and report 0 rather than nonsense.
-* Linux: `clock_gettime(CLOCK_MONOTONIC)` in the handler — which also has to
+* Linux: `clock_gettime(CLOCK_MONOTONIC)` in the handler which also has to
   distinguish a *timer* expiry from a *kick* (`raise` from `spawn`/exit) so
   `ticks` stays meaningful.
 * Windows: `QueryPerformanceCounter`, with the same timer-vs-kick distinction.
@@ -137,7 +137,7 @@ Timing accuracy is measured, not asserted:
 * The switch saves R4–R11 as **two 16-bit `stmia`s with `mov`s through r4–r7**,
   not one Thumb-2 `stmdb {r4-r11}`: the 16-bit LDM/STM encoding can only address
   r0–r7, and `thumbv6m` (Cortex-M0) has no Thumb-2. Cost: ~4 cycles on M3+.
-  `cbz` is avoided too (`cmp`/`beq` instead) — the first build against
+  `cbz` is avoided too (`cmp`/`beq` instead) the first build against
   `thumbv6m-none-eabi` failed with `instruction requires: armv8m.base`, which is
   exactly what building that extra target is for.
 * Task 0 (`main`) stays on **MSP** with `flags |= TCB_FLAG_USE_MSP`; `PendSV`
@@ -168,7 +168,7 @@ Timing accuracy is measured, not asserted:
   the tick thread suspend the wrong thread. The TCB the tick thread holds is
   pinned (`is_pinned`) and never reclaimed underneath it.
 * `shutdown` must not be done from a task thread: `ExitProcess` can deadlock
-  while other threads are suspended — observed here, not theorised. The tick
+  while other threads are suspended observed here, not theorised. The tick
   thread resumes every task and then terminates the process (`TerminateProcess`,
   after flushing the standard streams); a task that asks for shutdown parks, with
   a safety valve that terminates directly if the tick thread cannot run.
@@ -182,7 +182,7 @@ Timing accuracy is measured, not asserted:
   the alt stack and overwrite each other when the scheduler switches between them
   mid-handler. The handler therefore runs on the interrupted fibre's stack, which
   is *why* reclamation happens after the switch instead of before.
-* Two bugs only real execution could reveal — both found by running this on Linux:
+* Two bugs only real execution could reveal both found by running this on Linux:
   1. a fibre created by the scheduler is born *inside a signal handler's callee
      chain*, so the thread's `SIGALRM` mask is still blocked; the fibre ran once
      and was then never preempted again. `rrkernel_fibre_entry` unblocks it at
@@ -200,7 +200,7 @@ Timing accuracy is measured, not asserted:
 ### RISC-V 32 (`arch/riscv.rs`)
 
 Machine mode, one trap vector, no separate kernel stack. The trap entry (`mtvec`,
-direct mode) builds a 128-byte frame on the interrupted task's own stack — 28 GPRs
+direct mode) builds a 128-byte frame on the interrupted task's own stack 28 GPRs
 plus `mepc` and `mstatus`, all of it addressing `sp` directly:
 
 ```asm
@@ -235,7 +235,7 @@ rather than a `#[cfg]`:
 * **The slice is a 64-bit comparator.** `mtimecmp` is written half at a time with
   the timer interrupt masked and the high half parked at `0xFFFF_FFFF` first,
   because writing the low half last can leave a comparator the counter has already
-  passed — an interrupt storm. `mtime` is read high-low-high for the same reason.
+  passed an interrupt storm. `mtime` is read high-low-high for the same reason.
 
 `SchedulerConfig::timer_hz` is required (the interval is in `mtime` ticks and no
 portable register reports the frequency), and `arch::configure_timer` redirects the
@@ -263,7 +263,7 @@ rfeia sp!               ; load PC/CPSR from the frame: into the next task
 ```
 
 The frame is therefore `[pad][r0..r12][lr][PC][CPSR]` = 72 bytes, and a fresh task
-is created by writing `r0 = &tcb`, `PC = trampoline`, `CPSR = 0x13` — the same
+is created by writing `r0 = &tcb`, `PC = trampoline`, `CPSR = 0x13` the same
 "fabricate the frame the switch will consume" idea as everywhere else.
 
 Three platform lessons, all of them found by running it and none of them
@@ -278,7 +278,7 @@ guessable from the architecture manual alone:
    a non-secure one) with both vector slots pointing at one handler.
 2. **Critical-section token polarity is part of the port contract.** A port whose
    `critical_enter` returns "the mask bit" instead of "was enabled" leaves
-   interrupts masked forever after the first critical section — the kernel then
+   interrupts masked forever after the first critical section the kernel then
    looks hung for no visible reason. `arm_ar` did exactly that for one QEMU run.
 3. **The acknowledge register is not always trustworthy.** QEMU's GICv2 can
    return "no eligible pending interrupt" for an interrupt it *just delivered*.
@@ -292,7 +292,7 @@ run", needs only a 32-bit register read, and avoids depending on the `mrrc`
 instruction form (which the bundled assembler rejects, and which is why the 64-bit
 `CNTPCT` is not used here). `scheduler::stats().worst_latency` therefore means
 "worst timer overshoot, in ticks" on this port and "post-switch service time, in
-ticks" on RISC-V — the kernel's contract is that each port reports its own backend
+ticks" on RISC-V the kernel's contract is that each port reports its own backend
 latency in its own timer's units, not that they are the same quantity.
 
 ### Where the remaining architectures stand
@@ -343,21 +343,21 @@ mvn.w r0, #6 / bx r0              ; return 0xFFFFFFF9
 The vector table carries `_stack_start` (0x20010000), `__reset|1`, and
 `PendSV_Handler|1` (0x95), `SysTick_Handler|1` (0x120d). The firmware links to
 **5904 bytes of flash, 96 bytes of `.data`, 16512 bytes of `.bss`**, and the
-linker script asserts *at link time* that `.bss` stays below `_stack_start` — an
+linker script asserts *at link time* that `.bss` stays below `_stack_start` an
 assertion that fired during development when the default arena was 64 KiB, which
 is exactly why it is there.
 
 Behavioural verification:
 
-* `tests/ring_invariants.rs` — ring insertion/unlink/skip-dead, the ABI offset
+* `tests/ring_invariants.rs` ring insertion/unlink/skip-dead, the ABI offset
   contract, arena recycling and over-alignment, closure placement/drop semantics.
-* `examples/smoke.rs` — the backend sanity check: a task that returns, an
+* `examples/smoke.rs` the backend sanity check: a task that returns, an
   infinite task, a dynamic spawn, and stats at the end.
-* `examples/roundrobin_demo.rs` — the full life cycle with assertions (Task 2
+* `examples/roundrobin_demo.rs` the full life cycle with assertions (Task 2
   completed, Task 3 ran, ring length == `active_threads`, rotation happened).
-* `examples/jitter_bench.rs` — fairness and timing accuracy, measured against the
+* `examples/jitter_bench.rs` fairness and timing accuracy, measured against the
   kernel's own switch counter so the numbers are valid even with a coarse clock.
-* `firmware-cortex-m` — on-target evidence in a debugger-readable `REPORT`
+* `firmware-cortex-m` on-target evidence in a debugger-readable `REPORT`
   struct: `t1_loops` climbing (preemption), `t2_completed` (automatic exit),
   `t2_spawned_t3`/`t3_ran` (dynamic spawn), `ring_len == active_threads`,
   `slice_cycles` equal to the requested slice converted at `CORE_HZ`, and
@@ -389,15 +389,15 @@ VERDICT  : PASS  (round robin + automatic unlink + dynamic spawn)
 Both run the *same* application code (`firmware-common/`) and the same assertions,
 which is the point of the exercise: the port replaces the frame, the timer and the
 switch, and nothing else. The Cortex-M firmware predates that crate and keeps its
-own debugger-readable `REPORT` struct instead of a UART report — the same three
+own debugger-readable `REPORT` struct instead of a UART report the same three
 tasks, the same verdict, a different way of getting it off the board.
 
 Bring-up tooling that made this tractable, and is kept in the tree:
 
-* `arch::set_trap_hook` / `arch::set_trace_hook` (RISC-V and ARM A/R) — callbacks
+* `arch::set_trap_hook` / `arch::set_trace_hook` (RISC-V and ARM A/R) callbacks
   at the port's decision points, so a board with only a serial port can *show*
   what the kernel thinks instead of hanging silently.
-* `scripts/qemu-monitor-probe.ps1` — reads interrupt-controller, timer and kernel
+* `scripts/qemu-monitor-probe.ps1` reads interrupt-controller, timer and kernel
   state from inside a running QEMU guest, which distinguishes "never raised" from
   "raised and not taken" from "taken and switched wrongly".
 * QEMU's `-d int` plus the guest's own report: the pair that found the stale
@@ -410,7 +410,7 @@ Bring-up tooling that made this tractable, and is kept in the tree:
   the switch. The port surface is fixed, so this is additive.
 * **Release-time periodic tasks** (the "ns-precise periodic release" requirement)
   sit on top of this ring as a timer wheel that writes into the TCB's reserved
-  `slice_cycles`/state — no ABI change needed.
+  `slice_cycles`/state no ABI change needed.
 * **Per-task quantum** is already reserved in the TCB (`slice_cycles`), still
   pure round robin, for workloads that need longer stretches than others.
 * **FPU support on Cortex-M** means `vstmdb`/`vldmia` of S16–S31 in `PendSV` plus
@@ -438,7 +438,7 @@ per-core facts in the kernel are reduced to `smp::CpuArch`:
 and nothing narrower, Xtensa's `S32C1I` is a conditional *word* store, and AVR /
 `riscv32imc` have no atomic read-modify-write at all. So the interlock is typed as
 `LockWord`, a per-target alias, and on the targets with no atomic RMW it degrades to a
-local interrupt mask — correct mutual exclusion **on one core**, which is exactly why
+local interrupt mask correct mutual exclusion **on one core**, which is exactly why
 `supports_smp()` is `false` there and `set_active_cores(2)` returns a `ConfigError`.
 
 Two consequences worth stating explicitly, because both are easy to get wrong:
@@ -467,7 +467,7 @@ keeps a single global `KERNEL.current_tcb`. Real `active_cores > 1` needs per-co
 `const _` assertion stay valid), the global interlock taken by `critical_enter` when more
 than one core runs, IPI-driven rescheduling, and `arch::start_secondary_cores()` in each
 port. Until then `active_cores` is configuration and validation only, and the repository
-contains **no multi-core execution evidence** — `-smp 2` has never been run.
+contains **no multi-core execution evidence** `-smp 2` has never been run.
 
 ### 7.3 Sleeping `Mutex`, and forcing deadlock out of the design
 
@@ -475,7 +475,7 @@ The scheduler is pure round robin with no priorities, so neither priority inheri
 nor "just spin" is available. `sync::Mutex<T>` therefore:
 
 * **sleeps on contention.** `lock()` marks the caller's TCB `Blocked(lock id)` and asks
-the port for an immediate switch — O(1), so the waiter costs no CPU and gives its slice
+the port for an immediate switch O(1), so the waiter costs no CPU and gives its slice
 back to the system. `unlock()` wakes exactly the tasks blocked on that id.
 * **is identified.** Every lock has a monotonic `LockId` (created at runtime, or pinned
   with `Mutex::with_id` for a `static`), which is what makes the ordering rule below
@@ -490,7 +490,7 @@ back to the system. `unlock()` wakes exactly the tasks blocked on that id.
 (`held_locks`/`held_count`), and `try_acquire` refuses any lock whose id is not strictly
 greater than the last one held, with `LockError::OrderViolation { held, requested }`.
 Because ids are handed out in creation order, "acquire in increasing id order" is a total
-order over every lock in the system — and a cycle cannot exist in a total order. The
+order over every lock in the system and a cycle cannot exist in a total order. The
 price is a real constraint rather than a suggestion: **locks must be created in the order
 they will be acquired**, and the check is enforced at acquisition time so a violation is
 a refusal, not a hang.
@@ -503,7 +503,7 @@ the kernel does not have to know which locks exist) before backing off.
 ### 7.4 `TaskState::Blocked` and the ring
 
 A blocked task stays **linked** in the ring; `ring::next_runnable` skips it exactly as it
-skips a dead one. That choice is what keeps both directions O(1) — no queue has to be
+skips a dead one. That choice is what keeps both directions O(1) no queue has to be
 searched to put the task back, its rotation slot is preserved, and `ring::len()` still
 equals `active_threads` (which the demos assert). The cost is that the wake path is
 explicit: `wake_blocked_on(id)` walks the ring and flips matching tasks back to `Ready`,
@@ -524,7 +524,7 @@ ring walk is the cheaper trade, and the *context switch* it triggers is still O(
 The Xtensa port is bring-up complete but **not** passing: it builds with the esp-rs fork
 plus Espressif's GCC as linker, boots in Espressif's QEMU (`-machine esp32`), prints over
 UART0, takes its `CCOMPARE0` tick and runs the whole switch path (verified by `E T K N S R`
-markers) — then the *resume* lands in the wrong place. The evidence, the disproved
+markers) then the *resume* lands in the wrong place. The evidence, the disproved
 window-chain theory and the corrected root cause (`rsil` and `s32c1i` are illegal while
 `PS.EXCM` is set, which every trap runs with) are in `docs/ESP32.md`; the atomic and
 critical-section fixes that came out of it are in the tree and apply to every target.

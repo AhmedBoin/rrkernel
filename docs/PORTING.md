@@ -39,12 +39,12 @@ honest.
 
 ## Checklist, in dependency order
 
-1. **`plan_timer`** — validate `cfg.slice` against the real timer and return the
+1. **`plan_timer`** validate `cfg.slice` against the real timer and return the
    *achieved* values. Never clamp silently: `ConfigError::SliceBelowPlatformMinimum`
    / `SliceAboveTimerRange` / `TimerClockRequired` exist for exactly this. Bare
    metal ports must require the clock frequency (`cfg.timer_hz`), since only the
    application knows it.
-2. **`CriticalToken` + `critical_enter/exit`** — the smallest thing that makes a
+2. **`CriticalToken` + `critical_enter/exit`** the smallest thing that makes a
    critical section atomic: interrupt masking (`PRIMASK`/`BASEPRI`), a signal
    mask, or a lock. It must be nestable and must not block (the tick path enters
    it too).
@@ -52,36 +52,36 @@ honest.
    interrupts were already masked* and *non-zero when they were enabled*, because
    every backend's `critical_exit` restores by testing `token != 0`. Returning the
    raw mask bit instead (`PRIMASK == 1` meaning "masked") inverts the sense and
-   leaves interrupts masked forever after the first critical section — the kernel
+   leaves interrupts masked forever after the first critical section the kernel
    then appears to hang with nothing to show for it, which is exactly what
    happened to the ARM A/R port until it was traced. On CPUs with more than one
    interrupt class (ARM A/R masks both `I` and `F`), return the bits that were
    *clear* so `critical_exit` can restore them individually.
-3. **`adopt_current_task`** — turn the *calling* context into task 0. On bare
+3. **`adopt_current_task`** turn the *calling* context into task 0. On bare
    metal this means deciding where `main`'s stack lives. Keeping it on the kernel
    stack (as Cortex-M does via `TCB_FLAG_USE_MSP`) is the only way to avoid
    copying a live C stack; taking a fresh stack requires assembly that relocates
    it, plus a warning that any frame pointer in the copied frames breaks.
-4. **`create_task`** — allocate the task's stack (usually
+4. **`create_task`** allocate the task's stack (usually
    `crate::scheduler::arena()`), then craft an initial register frame whose
    program counter is `crate::trampoline::task_trampoline` and whose first
    argument is the TCB pointer. The frame must be laid out exactly as the
    switch's *restore* path expects: a first switch and a resumed switch must be
    indistinguishable.
-5. **`request_switch`** — make the CPU switch as soon as the critical section (if
+5. **`request_switch`** make the CPU switch as soon as the critical section (if
    any) exits: pend an exception, signal an event, raise a signal. Do **not**
    perform the switch inline from a task unless the target makes that
    unavoidable (the POSIX port is the exception, and the reason is documented).
-6. **`exit_current_task_forever`** — what a task runs after unlinking itself. On
+6. **`exit_current_task_forever`** what a task runs after unlinking itself. On
    bare metal this is a `wfi`/spin loop: the switch takes the CPU away and the
    stack is recycled, so the loop is never re-entered. On a host, terminating the
    OS context (`ExitThread`) is usually right.
-7. **`idle_forever` / `shutdown`** — the "ring is empty" and "stop the kernel"
+7. **`idle_forever` / `shutdown`** the "ring is empty" and "stop the kernel"
    paths. Prefer a real low-power wait (`wfi`) over a spin.
-8. **`is_pinned`** — only needed if the reclaimer can run *concurrently* with the
+8. **`is_pinned`** only needed if the reclaimer can run *concurrently* with the
    switch and needs a TCB to stay alive (the Win32 tick thread does; POSIX and
    Cortex-M do not).
-9. **Where to call `scheduler::reclaim_finished_tasks()`** — the subtlest
+9. **Where to call `scheduler::reclaim_finished_tasks()`** the subtlest
    decision in a port. It frees the finished task's stack, so it must run in a
    context that is **not** on that stack:
    * its own kernel stack (Cortex-M: `PendSV` on MSP) → before the switch;
@@ -96,7 +96,7 @@ honest.
   (`xPSR, PC, LR, R12, R3..R0`) plus the software-saved `R4-R11`, with `R0`
   carrying the TCB. Push order and the `thumbv6m`-safe register moves are
   documented inline, including why `stmdb {r4-r11}` and `cbz` are unusable.
-* **RISC-V 32** (`src/arch/riscv.rs`): 128-byte frame — 28 GPRs plus `mepc` and
+* **RISC-V 32** (`src/arch/riscv.rs`): 128-byte frame 28 GPRs plus `mepc` and
   `mstatus`, addressed from `sp`, consumed by `mret`. `gp`/`tp` are left alone
   because they are constant for a single-hart bare-metal kernel. `mtimecmp` is
   written with the high half parked at `0xFFFF_FFFF` so a 32-bit bus cannot expose
@@ -119,12 +119,12 @@ switch. It is the only writer of the kernel's clock and the only place expired d
 swept, so a port that omits it looks perfectly healthy while being wrong in four ways at once:
 
 * `scheduler::tick_count()` stays 0 forever;
-* `sleep_ticks()` / `sleep_secs()` never wake — the task is off the CPU permanently;
+* `sleep_ticks()` / `sleep_secs()` never wake the task is off the CPU permanently;
 * `sync::Mutex::try_lock_for` never times out (its deadline sweep is the same path);
 * every `ticks > 0` invariant in the demos fails.
 
 On Cortex-M this was a real, long-lived bug: the tick handler measured the period error and
-poked `PendSV`, the switch happened, tasks ran — and the clock simply never moved. The
+poked `PendSV`, the switch happened, tasks ran and the clock simply never moved. The
 symptom was a task waiting for 300 ticks forever, with a healthy-looking system and no
 output, which is exactly the kind of failure that is worth designing against: the port now
 also has a **black box** (see `app_support`) so the last thing the kernel said survives a
@@ -133,12 +133,12 @@ hang.
 ## Trap entry symbols: two naming conventions, both supported
 
 Most of the Cortex-M ecosystem (`cortex-m-rt` and the device crates) names the core exception
-vectors **without** the `_Handler` suffix — `SysTick`, `PendSV`, `HardFault` — while a
+vectors **without** the `_Handler` suffix `SysTick`, `PendSV`, `HardFault` while a
 hand-written vector table (like `firmware-cortex-m`) names them `SysTick_Handler`,
 `PendSV_Handler`. The Cortex-M port exports **both**, the short ones as one-instruction
 branches to the real handlers, so either table reaches the same code. This matters more than
 it looks: a port that provides only one spelling is silently unreachable from half the
-ecosystem, and the failure mode is that every tick lands in `DefaultHandler` — the software
+ecosystem, and the failure mode is that every tick lands in `DefaultHandler` the software
 appears to hang, with no fault and nothing to read.
 
 
@@ -149,7 +149,7 @@ macOS/BSD:
 2. `struct sigaction` on Darwin has `sa_mask` as a `sigset_t` and no
    `sa_restorer`; field order is `handler, mask, flags`.
 3. `sigevent` differs (`sigev_notify_function`, `sigev_notify_attributes`), and
-   the `SA_RESTART`/`SIGEV_SIGNAL`/`SA_ONSTACK` *values* differ — do not reuse the
+   the `SA_RESTART`/`SIGEV_SIGNAL`/`SA_ONSTACK` *values* differ do not reuse the
    Linux constants.
 4. `timer_create` exists on Darwin, but verify the clock (`mach_absolute_time`
    semantics) before trusting the slice.
@@ -170,7 +170,7 @@ repository's history.
 ## Adding multi-core support to a port
 
 Single-core ports need nothing from this section. A port that *can* run more than one
-core implements `smp::CpuArch` — five functions, all of them hardware queries:
+core implements `smp::CpuArch` five functions, all of them hardware queries:
 
 ```rust
 fn current_core_id() -> usize;          // mhartid / MPIDR / PRID / OS thread id
@@ -188,12 +188,12 @@ Three things to get right, each of which has already bitten this repository:
    tree: RISC-V's `A` extension is 32-bit only, Xtensa's `S32C1I` is a conditional
    *word* store, and AVR / `riscv32imc` have no atomic RMW at all. `LockWord` is a
    per-target alias for that reality; where there is no atomic RMW the interlock is a
-   local interrupt mask, and `supports_smp()` must then return `false` — a masked
+   local interrupt mask, and `supports_smp()` must then return `false` a masked
    test-and-set protects nothing against another core.
 2. **Local masking is the lock\'s job, not the trait\'s.** `smp::SpinLock` masks
    (via the port\'s own `critical_enter`) *around* the interlock. Skipping the mask lets
    a core be interrupted by its own tick while holding a lock and then spin forever
-   waiting for itself — the classic self-deadlock that a cross-core lock does not
+   waiting for itself the classic self-deadlock that a cross-core lock does not
    protect against at all.
 3. **`send_ipi` must not be a lie.** It is called when a task becomes runnable on a
    core other than the one that is about to sleep, so "silently do nothing" turns into
@@ -208,16 +208,16 @@ Three things to get right, each of which has already bitten this repository:
 Implementing `CpuArch` makes the *kernel* core-agnostic; starting a core is separate
 work, and it is **not done yet for any port**:
 
-* **per-core `current_tcb`** — the kernel keeps one global today, and `PendSV` reads it
+* **per-core `current_tcb`** the kernel keeps one global today, and `PendSV` reads it
   at a *literal offset 0*, so per-core state has to be appended after it and the
   `const _` layout assertion extended rather than moved;
-* **the global interlock** — `critical_enter` must take the kernel spinlock in addition
+* **the global interlock** `critical_enter` must take the kernel spinlock in addition
   to masking once more than one core is active, or two cores will mutate the ring
   simultaneously;
-* **secondary bring-up** — RISC-V `-smp 2` with `-bios none` starts *every* hart at the
+* **secondary bring-up** RISC-V `-smp 2` with `-bios none` starts *every* hart at the
   reset vector, so a `mhartid` lottery plus a park word is enough (non-boot harts spin
   on the word and `wfi`); ARM wants PSCI `CPU_ON` over the configured conduit;
-* **IPI-driven rescheduling** — the reason `send_ipi` exists at all.
+* **IPI-driven rescheduling** the reason `send_ipi` exists at all.
 
 Success criterion, once those land: the shared demo asserts that both cores took ticks,
 run under `qemu-system-riscv32 -M virt -smp 2` and `qemu-system-arm -M virt -smp 2`.
@@ -228,7 +228,7 @@ Until then treat `active_cores > 1` as configuration and validation only.
 The kernel core is already free of atomics and 16-bit-`usize`-clean, but two layers are
 cfg-gated on `target_has_atomic`:
 
-* `sync` (sleeping `Mutex`) is compiled out — see §"the lock word" above;
+* `sync` (sleeping `Mutex`) is compiled out see §"the lock word" above;
 * `smp::supports_smp()` is `false`, so `set_active_cores(2)` fails loudly.
 
 That is deliberate, and the same reasoning the AVR note in `src/arch/mod.rs` uses: an
