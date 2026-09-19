@@ -48,7 +48,11 @@ fn reuse_at_a_different_size_keeps_live_bytes_exact() {
         let s = a.stats();
         assert_eq!(s.live_bytes, 64, "freeing returns live to the companion");
         assert_eq!(s.free_blocks, 1, "the block is on the free list");
-        assert_eq!(s.peak_live_bytes, 64 + 512, "the peak is not lowered by a free");
+        assert_eq!(
+            s.peak_live_bytes,
+            64 + 512,
+            "the peak is not lowered by a free"
+        );
 
         let small = a.alloc(128, 8).expect("reuse for a smaller request");
         let s = a.stats();
@@ -132,7 +136,11 @@ fn repeated_recycles_at_decreasing_sizes_never_drift() {
 
         a.free(cur);
         a.free(keep);
-        assert_eq!(a.stats().live_bytes, 0, "everything freed leaves nothing live");
+        assert_eq!(
+            a.stats().live_bytes,
+            0,
+            "everything freed leaves nothing live"
+        );
         assert_eq!(a.stats().free_blocks, 2, "both blocks are on the free list");
         assert_eq!(
             a.stats().peak_live_bytes,

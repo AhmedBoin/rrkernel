@@ -490,7 +490,12 @@ back to the system. `unlock()` wakes exactly the tasks blocked on that id.
 (`held_locks`/`held_count`), and `try_acquire` refuses any lock whose id is not strictly
 greater than the last one held, with `LockError::OrderViolation { held, requested }`.
 Because ids are handed out in creation order, "acquire in increasing id order" is a total
-order over every lock in the system and a cycle cannot exist in a total order. The
+order over every lock in the system and a cycle cannot exist in a total order. The stack is
+bounded by `MAX_HELD_LOCKS` (4), and hitting that bound is **refused** with
+`LockError::TooManyHeldLocks` rather than granted untracked: a lock that cannot be *recorded*
+would escape `release_all_held_locks` (so the back-off recovery path could never free it) and
+would make every later check compare against the wrong last-held id, quietly stopping the rule
+from being enforced from that depth on. The
 price is a real constraint rather than a suggestion: **locks must be created in the order
 they will be acquired**, and the check is enforced at acquisition time so a violation is
 a refusal, not a hang.
@@ -515,9 +520,9 @@ ring walk is the cheaper trade, and the *context switch* it triggers is still O(
 
 | | |
 |---|---|
-| `smp.rs`, `sync.rs`, `Blocked`, `active_cores`, spinlocks | implemented; `cargo test --features std` (8 + 2) and all six bare-metal targets build |
+| `smp.rs`, `sync.rs`, `Blocked`, `active_cores`, spinlocks | implemented; `cargo test --features std` (24 + 2 doctests) and all six bare-metal targets build |
 | Multi-core scheduling on `-smp 2` (RISC-V / ARM) | **not implemented, never run** |
-| `sync` at runtime (contention, timeout, back-off) | **not exercised**; the layer is host-*compiled* and unit-untested |
+| `sync` at runtime (contention, timeout, back-off) | **not exercised**: the ordering rule and the nesting-depth refusal are unit-tested (`tests/lock_depth.rs`, deterministic, no scheduler needed), but nothing has yet made two tasks actually contend for one lock |
 
 ### 7.6 ESP32 / Xtensa, in one paragraph
 
