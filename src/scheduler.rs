@@ -149,8 +149,15 @@ pub fn init_with(cfg: SchedulerConfig) -> Result<(), ConfigError> {
         (*root).children_head = ptr::null_mut();
         (*root).current_child = ptr::null_mut();
         (*root).state = TaskState::Ready;
-        (*root).slice_cycles = 1;
-        (*root).remaining_cycles = 1;
+        // The root never expires: its quantum is unbounded, so the top-level rotation is
+        // driven by each level-1 node's *own* quantum rather than by the root's. With a
+        // one-tick root quantum (the obvious-looking choice) every level-1 node would
+        // advance the root's cursor on every tick, which truncates any deeper visit to a
+        // single tick and makes a group unable to ever complete a multi-tick visit.
+        // With an unbounded root, depth 1 is still exactly the flat scheduler: a level-1
+        // leaf's quantum is one tick, so its expiry is what advances the root's cursor.
+        (*root).slice_cycles = u32::MAX;
+        (*root).remaining_cycles = u32::MAX;
         *KERNEL.root.get() = root;
 
         // --- adopt the calling context as task 0 ---------------------------
@@ -1649,4 +1656,254 @@ where
     }
     drop(g);
     Ok(tcb)
+}
+
+// ---------------------------------------------------------------------------
+// Nested scheduling tests
+//
+// These drive the *real* entry points (`on_tick` and `schedule_next`) against
+// hand-built TCB trees: no timer, no hardware, no interrupts, deterministic. Every
+// claim in docs/NESTED_SCHEDULING.md is a claim about the order these two produce,
+// and an off-by-one in the drain order is exactly the bug that would otherwise only
+// appear after hours of runtime.
+//
+// One `#[test]` function on purpose: the cases share the global `KERNEL`, and the lib
+// test binary runs tests in parallel. They run in sequence instead.
+// ---------------------------------------------------------------------------
+#[cfg(all(test, feature = "std"))]
+mod nested_tests {
+    use super::*;
+    use crate::tcb::NodeKind;
+
+    /// A zeroed TCB, exactly as `alloc_tcb` produces one, leaked so it outlives the case.
+    unsafe fn node(kind: NodeKind, quantum: u32, id: u32) -> *mut TaskControlBlock {
+        let p = Box::into_raw(Box::new(core::mem::zeroed::<TaskControlBlock>()));
+        ptr::write_bytes(p as *mut u8, 0, core::mem::size_of::<TaskControlBlock>());
+        (*p).kind = kind;
+        (*p).state = TaskState::Ready;
+        (*p).id = id;
+        (*p).slice_cycles = quantum;
+        (*p).remaining_cycles = quantum;
+        p
+    }
+
+    /// Link `kids` into a circular ring owned by `parent`, cursor at the first.
+    unsafe fn attach(parent: *mut TaskControlBlock, kids: &[*mut TaskControlBlock]) {
+        for (i, k) in kids.iter().enumerate() {
+            let c = *k;
+            (*c).parent = parent;
+            if i == 0 {
+                crate::ring::insert_after(ptr::null_mut(), c);
+            } else {
+                crate::ring::insert_after(kids[i - 1], c);
+            }
+        }
+        (*parent).children_head = kids[0];
+        (*parent).current_child = kids[0];
+    }
+
+    unsafe fn install(root: *mut TaskControlBlock, cur: *mut TaskControlBlock) {
+        *KERNEL.root.get() = root;
+        KERNEL.set_current(cur);
+    }
+
+    /// One hardware tick plus the switch the port would perform. Returns the node that is
+    /// current afterwards — which may be the one that was already running, the "no switch"
+    /// case the host backends have to tolerate.
+    unsafe fn tick() -> *mut TaskControlBlock {
+        on_tick();
+        let next = schedule_next();
+        if !next.is_null() {
+            KERNEL.set_current(next);
+        }
+        KERNEL.current()
+    }
+
+    #[test]
+    fn nested_scheduling_invariants() {
+        unsafe {
+            // --- depth 1 is the flat scheduler -------------------------------------
+            {
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let a = node(NodeKind::Leaf, 1, 1);
+                let b = node(NodeKind::Leaf, 1, 2);
+                let c = node(NodeKind::Leaf, 1, 3);
+                attach(root, &[a, b, c]);
+                install(root, a);
+                let seq: Vec<u32> = (0..6).map(|_| (*tick()).id).collect();
+                // `a` already held the CPU before the first tick, so the first tick hands
+                // over to `b`: the flat rotation, unchanged.
+                assert_eq!(seq, vec![2, 3, 1, 2, 3, 1], "depth-1 rotation");
+            }
+
+            // --- underflow: children finish early, so the lap repeats ---------------
+            {
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                // Group window 6 ticks, children 1 tick each: both children finish several
+                // laps *inside* the one visit, which is the underflow case. The window must
+                // not run out early, and the group's budget must not be reset by a lap.
+                let g = node(NodeKind::Group, 6, 10);
+                let c1 = node(NodeKind::Leaf, 1, 11);
+                let c2 = node(NodeKind::Leaf, 1, 12);
+                attach(root, &[g]);
+                attach(g, &[c1, c2]);
+                install(root, c1);
+                let seq: Vec<u32> = (0..5).map(|_| (*tick()).id).collect();
+                assert_eq!(
+                    seq,
+                    vec![12, 11, 12, 11, 12],
+                    "children lap repeatedly inside one visit, alternating"
+                );
+                assert_eq!(
+                    (*g).remaining_cycles,
+                    1,
+                    "the visit's budget is spent once per tick, not once per lap"
+                );
+                assert_eq!((*g).current_child, c2, "and the cursor advanced lap by lap");
+            }
+
+            // --- overflow: truncate mid-visit, resume without rewinding -------------
+            {
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let g = node(NodeKind::Group, 10, 20);
+                let c1 = node(NodeKind::Leaf, 8, 21);
+                let c2 = node(NodeKind::Leaf, 8, 22);
+                let sib = node(NodeKind::Leaf, 1, 23);
+                attach(root, &[g, sib]);
+                attach(g, &[c1, c2]);
+                install(root, c1);
+                let mut seq: Vec<u32> = Vec::new();
+                for _ in 0..10 {
+                    seq.push((*tick()).id);
+                }
+                // Ticks 1..7 keep c1 (no switch, its own 8-tick quantum still has budget);
+                // tick 8 exhausts it and hands over to c2; ticks 9..10 run c2; the group's
+                // 10-tick window closes on tick 10, so the turn leaves for the sibling with
+                // c2 still unspent.
+                assert_eq!(
+                    seq,
+                    vec![21, 21, 21, 21, 21, 21, 21, 22, 22, 23],
+                    "c1 for 8 ticks, c2 for 2, then the window closes to the sibling"
+                );
+                assert_eq!((*c2).remaining_cycles, 6, "c2 keeps what it had left");
+                let back = tick();
+                assert_eq!((*back).id, 22, "the group resumes at the child it was on");
+                assert_eq!(
+                    (*c2).remaining_cycles,
+                    6,
+                    "and c2's budget is untouched: the drain only ever spends the running path"
+                );
+                assert_eq!((*g).current_child, c2, "the group's cursor was not reset");
+                assert_eq!(
+                    (*g).remaining_cycles,
+                    10,
+                    "armed to a full fresh visit during the dispatch: the drain for this tick \
+                     ran before it, and the group was not on the running path"
+                );
+            }
+
+            // --- mid-visit preemption keeps the exact remaining budget --------------
+            {
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let g = node(NodeKind::Group, 3, 30);
+                let leaf = node(NodeKind::Leaf, 10, 31);
+                let sib = node(NodeKind::Leaf, 1, 32);
+                attach(root, &[g, sib]);
+                attach(g, &[leaf]);
+                install(root, leaf);
+                // Two ticks: the leaf's own 10-tick quantum still has budget, so no switch.
+                assert_eq!((*tick()).id, 31);
+                assert_eq!((*tick()).id, 31);
+                // The third spends the group's 3-tick window, and the turn leaves.
+                assert_eq!(
+                    (*tick()).id,
+                    32,
+                    "the group's window closing moves the turn out"
+                );
+                assert_eq!((*leaf).remaining_cycles, 7, "the leaf kept 10 - 3");
+                // Next visit: resumed, not re-armed. The leaf's budget is unchanged from
+                // the moment the group's window closed, because the ticks in between ran a
+                // different subtree and the drain only ever spends the running path.
+                assert_eq!((*tick()).id, 31, "resumed when the group is visited again");
+                assert_eq!((*leaf).remaining_cycles, 7, "resumed, not re-armed");
+            }
+
+            // --- every child blocked: bubble up, and do not burn the group's budget --
+            {
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let g = node(NodeKind::Group, 5, 40);
+                let b1 = node(NodeKind::Leaf, 1, 41);
+                let b2 = node(NodeKind::Leaf, 1, 42);
+                let other = node(NodeKind::Leaf, 1, 43);
+                attach(root, &[g, other]);
+                attach(g, &[b1, b2]);
+                (*b1).state = TaskState::Blocked;
+                (*b2).state = TaskState::Blocked;
+                install(root, other);
+                let before = (*g).remaining_cycles;
+                let who = tick();
+                assert_eq!(
+                    (*who).id,
+                    43,
+                    "a group with nothing runnable must neither be switched to nor spin"
+                );
+                assert_eq!(
+                    (*g).remaining_cycles,
+                    before,
+                    "an idle group's budget is paused, not spent"
+                );
+            }
+
+            // --- a sleep inside a group expires even while its group is starved -----
+            {
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let g = node(NodeKind::Group, 4, 50);
+                let sleeper = node(NodeKind::Leaf, 1, 51);
+                let busy = node(NodeKind::Leaf, 1, 52);
+                attach(root, &[g, busy]);
+                attach(g, &[sleeper]);
+                install(root, busy);
+                (*sleeper).state = TaskState::Blocked;
+                (*sleeper).blocked_on = 0x1234;
+                (*sleeper).block_deadline = *KERNEL.ticks.get() + 3;
+                // The group is never dispatched during these ticks — the busy sibling holds
+                // the CPU. The deadline must still expire, which is only possible if the
+                // tick path walks the whole tree rather than the level-1 ring.
+                for _ in 0..5 {
+                    let _ = tick();
+                }
+                assert_ne!(
+                    (*sleeper).state,
+                    TaskState::Blocked,
+                    "a deadline expires at depth even though its group was never scheduled"
+                );
+                assert_eq!((*sleeper).block_deadline, 0, "and the deadline is cleared");
+                assert_eq!((*sleeper).blocked_on, 0, "and the resource wait is cleared");
+            }
+
+            // --- a stale cursor (child died and unlinked) is survived --------------
+            {
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let g = node(NodeKind::Group, 2, 60);
+                let dead = node(NodeKind::Leaf, 1, 61);
+                let live = node(NodeKind::Leaf, 1, 62);
+                attach(root, &[g]);
+                // The ring's *head* stays valid (this is what `exit_task` guarantees when it
+                // repairs a parent's head and cursor); only the group's cursor is left
+                // pointing at a child that has since finished and unlinked itself.
+                attach(g, &[live, dead]);
+                crate::ring::unlink(dead);
+                (*dead).state = TaskState::Dead;
+                (*g).current_child = dead;
+                install(root, live);
+                let who = tick();
+                assert_eq!(
+                    (*who).id,
+                    62,
+                    "a cursor pointing at a dead, unlinked child must not wedge the group"
+                );
+                assert_eq!((*g).current_child, live, "and the cursor is repaired");
+            }
+        }
+    }
 }

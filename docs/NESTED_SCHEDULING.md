@@ -52,6 +52,7 @@ Everything else follows:
 |---|---|
 | the tick | the slice passed to `configure()`, in timer cycles (`KERNEL.config.slice_cycles`) |
 | a node's quantum (`slice_cycles`) | **ticks**; `1` is the configured slice |
+| the root's quantum | unbounded (the root never expires) — top-level rotation is driven by each level-1 node's own quantum, which is what a multi-tick group visit needs |
 | a node's remaining budget (`remaining_cycles`) | ticks; `0` means "not armed" |
 | every sleep, timeout and deadline | global ticks (`KERNEL.ticks`) — never a per-node clock |
 
