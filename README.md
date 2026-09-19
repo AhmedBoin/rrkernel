@@ -234,6 +234,25 @@ CI runs four jobs: `posix-core` (fmt, clippy, tests, examples), `windows`, `bare
 and release** for six targets + clippy), and `qemu` (verdicts for RISC-V 32 and ARM A/R). The dev
 build matters: `lto = "fat"` defers codegen, and a release-only build once hid a real compile error.
 
+<details>
+<summary><b>Publishing (maintainers)</b></summary>
+
+The crate is deliberately **not** buildable for a host target without the `std` feature — there is no
+backend to select, so it is a `compile_error!` with an explanation. `cargo publish` verifies by
+building for the host, so the verification has to be pointed at a target this crate actually claims:
+
+```bash
+cargo publish -p rrkernel-macros                       # the proc-macro crate first
+cargo publish -p rrkernel --target thumbv7m-none-eabi # then the kernel
+```
+
+`[package.metadata.docs.rs]` sets `features = ["std"]` so docs.rs (which builds for x86_64) succeeds
+instead of reporting a build failure.
+
+Currently published: **`rrkernel` 0.3.0** and **`rrkernel-macros` 0.2.0**.
+
+</details>
+
 ## Honest limits
 
 <details>
