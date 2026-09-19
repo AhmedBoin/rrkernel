@@ -104,6 +104,18 @@ pub mod critical;
 /// [`event::wait_until`] poll-yield fallback. Everything an I/O or async layer needs to block a task
 /// without burning its slice.
 pub mod event;
+/// The async layer (`feature = "async"`): [`exec::block_on`], the task `Waker`, `Sleep`. A `.await`
+/// that returns `Pending` gives up the slice exactly like a blocking call does.
+#[cfg(feature = "async")]
+pub mod exec;
+/// `embedded-hal` / `embedded-hal-async` adapters (opt-in): delays, the blocking facade over an
+/// async driver, and a kernel-mutex device for a bus shared between tasks.
+#[cfg(any(feature = "hal", feature = "hal-async"))]
+pub mod hal;
+/// `embedded-io` / `embedded-io-async` byte streams (opt-in) on top of an ISR-driven
+/// [`event::Signal`].
+#[cfg(any(feature = "io", feature = "io-async"))]
+pub mod io;
 pub mod ring;
 pub mod scheduler;
 pub mod smp;

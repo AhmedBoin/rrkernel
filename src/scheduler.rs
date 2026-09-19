@@ -680,6 +680,76 @@ pub unsafe fn take_wake_flag_locked() -> bool {
     set
 }
 
+/// Clear the calling task's timer deadline. Used by an executor before each poll, so only the
+/// deadlines *this* poll armed are honoured.
+pub fn clear_timer_deadline() {
+    let g = critical::enter();
+    unsafe {
+        let me = KERNEL.current();
+        if !me.is_null() {
+            (*me).block_deadline = 0;
+        }
+    }
+    drop(g);
+}
+
+/// Arm the calling task's timer deadline, keeping the **earliest** of the ones requested.
+///
+/// A task can have several pending timers at once (two futures under `join!`, say), and the tick
+/// sweep can only know about one — so it gets the earliest, and each future re-arms on its next
+/// poll. Whichever fires first wakes the task, which then polls all of them.
+///
+/// The field is the same `block_deadline` the blocking path uses: while the task is `Ready` it
+/// carries "when this task wants to run again", and when the task blocks it becomes the block's own
+/// deadline (the executor passes this value straight to `park`, so it is not clobbered).
+pub fn set_timer_deadline(deadline_tick: u64) {
+    if deadline_tick == 0 {
+        return;
+    }
+    let g = critical::enter();
+    unsafe {
+        let me = KERNEL.current();
+        if !me.is_null() {
+            let cur = (*me).block_deadline;
+            if cur == 0 || deadline_tick < cur {
+                (*me).block_deadline = deadline_tick;
+            }
+        }
+    }
+    drop(g);
+}
+
+/// The calling task's timer deadline (0 = none).
+pub fn task_timer_deadline() -> u64 {
+    let g = critical::enter();
+    let d = unsafe {
+        let me = KERNEL.current();
+        if me.is_null() {
+            0
+        } else {
+            (*me).block_deadline
+        }
+    };
+    drop(g);
+    d
+}
+
+/// Drop an unconsumed wake on the floor.
+///
+/// An executor calls this before polling: a wake that arrives *during* the poll sets the flag
+/// again, `park` then returns immediately, and the future is polled again — which is the property
+/// that makes a lost wake-up impossible without any extra bookkeeping.
+pub fn clear_wake_flag() {
+    let g = critical::enter();
+    unsafe {
+        let me = KERNEL.current();
+        if !me.is_null() {
+            (*me).flags &= !crate::tcb::TCB_FLAG_WOKEN;
+        }
+    }
+    drop(g);
+}
+
 /// Make the **first** task blocked on `resource` runnable, and say whether one was found. O(ring).
 ///
 /// This is the single-waiter hand-off a `WaitQueue` needs. `wake_blocked_on` wakes everyone, which

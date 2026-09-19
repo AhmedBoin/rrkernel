@@ -627,3 +627,21 @@ pub unsafe fn is_pinned(_tcb: *mut TaskControlBlock) -> bool {
 pub fn parks_synchronously() -> bool {
     false
 }
+
+/// The port's free-running cycle counter, where one is usable.
+///
+/// `Some` only when the counter exists *and* is known to keep counting while the core is idle.
+/// `None` means "no counter here", never "a counter with a different unit" - a caller that gets
+/// `None` must fall back to the tick clock (see `time::Instant`).
+pub fn cycle_counter() -> Option<u32> {
+    // No free-running counter wired for this port yet, and the honest answer is `None`: callers
+    // fall back to the tick clock instead of silently getting a different unit. (ARM A/R has the
+    // generic timer's counter available; Xtensa has CCOUNT, but reading it needs the nightly
+    // asm feature this port already gates on.)
+    None
+}
+
+/// The frequency of [`cycle_counter`] in Hz (0 when there is no counter).
+pub fn cycle_counter_hz() -> u32 {
+    0
+}

@@ -689,3 +689,29 @@ pub unsafe fn is_pinned(_tcb: *mut TaskControlBlock) -> bool {
 pub fn parks_synchronously() -> bool {
     true
 }
+
+/// The port's free-running cycle counter, where one is usable.
+///
+/// `Some` only when the counter exists *and* is known to keep counting while the core is idle.
+/// `None` means "no counter here", never "a counter with a different unit" - a caller that gets
+/// `None` must fall back to the tick clock (see `time::Instant`).
+pub fn cycle_counter() -> Option<u32> {
+    // `DWT_OK` is set during `configure`: 1 = this core has a usable CYCCNT. It keeps counting
+    // while the core is idle - measured on an STM32F103C8: 997 per mille across an idle window in
+    // which the wait counter proved one `wfi` per tick - which is what makes it usable as a clock.
+    if DWT_OK.load(core::sync::atomic::Ordering::Relaxed) == 1 {
+        Some(unsafe { rd(DWT_CYCCNT) })
+    } else {
+        None
+    }
+}
+
+/// The frequency of [`cycle_counter`] in Hz (0 when there is no counter).
+pub fn cycle_counter_hz() -> u32 {
+    let hz = configured_hz();
+    if hz == 0 {
+        NOMINAL_HZ
+    } else {
+        hz
+    }
+}

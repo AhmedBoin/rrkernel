@@ -730,3 +730,26 @@ pub unsafe fn is_pinned(_tcb: *mut TaskControlBlock) -> bool {
 pub fn parks_synchronously() -> bool {
     true
 }
+
+/// The port's free-running cycle counter, where one is usable.
+///
+/// `Some` only when the counter exists *and* is known to keep counting while the core is idle.
+/// `None` means "no counter here", never "a counter with a different unit" - a caller that gets
+/// `None` must fall back to the tick clock (see `time::Instant`).
+pub fn cycle_counter() -> Option<u32> {
+    let c: u32;
+    // `rdcycle` is unprivileged on this target and counts at the core clock, so it is the same
+    // quantity the Cortex-M port reads from DWT.
+    unsafe { core::arch::asm!("rdcycle {}", out(reg) c, options(nomem, nostack)) };
+    Some(c)
+}
+
+/// The frequency of [`cycle_counter`] in Hz (0 when there is no counter).
+pub fn cycle_counter_hz() -> u32 {
+    let hz = crate::scheduler::config().timer_hz;
+    if hz == 0 {
+        1
+    } else {
+        hz
+    }
+}
