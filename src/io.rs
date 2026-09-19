@@ -238,9 +238,9 @@ mod blocking_io {
         }
     }
 
-    // With `std` switched on, `embedded_io::Error` also requires `std::error::Error`.
-    #[cfg(feature = "std")]
-    impl std::error::Error for PipeError {}
+    // `embedded_io::Error` requires `core::error::Error`, which *is* `std::error::Error` (std
+    // re-exports it), so one impl covers the hosted and the bare-metal builds alike.
+    impl core::error::Error for PipeError {}
 
     impl embedded_io::ErrorType for Pipe {
         type Error = PipeError;

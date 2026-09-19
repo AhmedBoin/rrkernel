@@ -827,6 +827,16 @@ pub fn yield_now() {
 pub struct TaskId(u32);
 
 impl TaskId {
+    /// A `TaskId` from a raw id.
+    ///
+    /// For a waker that stored the number rather than the type — an ISR, a `u32` field in a driver, a
+    /// queue of ids. Ids are never reused, so a raw id that names a task always names the right one,
+    /// and a raw id that names nothing is harmless: [`crate::scheduler::wake_task`] walks the ring and
+    /// does nothing.
+    pub const fn from_raw(raw: u32) -> TaskId {
+        TaskId(raw)
+    }
+
     /// The raw id, as stored in the TCB. `0` means "no task".
     pub const fn raw(self) -> u32 {
         self.0

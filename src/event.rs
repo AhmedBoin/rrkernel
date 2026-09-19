@@ -9,7 +9,9 @@
 //! own id for `Signal`, an allocated resource id for `WaitQueue`), which is the same keyed-blocking
 //! mechanism the mutex already uses.
 
-use crate::scheduler::{self, BlockOutcome, TaskId};
+/// Re-exported so an event user names the same type the scheduler does.
+pub use crate::scheduler::TaskId;
+use crate::scheduler::{self, BlockOutcome};
 use core::cell::UnsafeCell;
 
 /// A wait that ran out of time.
