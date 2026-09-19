@@ -100,6 +100,10 @@ pub mod arch;
 pub mod closure;
 pub mod config;
 pub mod critical;
+/// Events and waiting: [`event::park`], [`event::Signal`], [`event::WaitQueue`], and the
+/// [`event::wait_until`] poll-yield fallback. Everything an I/O or async layer needs to block a task
+/// without burning its slice.
+pub mod event;
 pub mod ring;
 pub mod scheduler;
 pub mod smp;
@@ -114,7 +118,12 @@ pub mod thread;
 pub mod trampoline;
 
 pub use config::{ConfigError, PlatformLimits, SchedulerConfig, Slice};
-pub use scheduler::{main_body, SchedulerStats, TaskInfo};
+pub use event::{park, wait_until, wake, Signal, Timeout, WaitQueue, WakeReason};
+pub use scheduler::{
+    block_for_ticks, block_until_tick, block_until_tick_if, current_id, deadline_after_ticks,
+    main_body, sleep_until_tick, wake_first_blocked_on, wake_task, yield_now, BlockOutcome,
+    SchedulerStats, TaskId, TaskInfo,
+};
 pub use smp::CpuArch;
 #[cfg(target_has_atomic = "32")]
 pub use sync::{LockError, LockId, Mutex, MutexGuard};

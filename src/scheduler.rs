@@ -536,6 +536,9 @@ pub unsafe fn record_period_error(value: u32) {
 /// What a blocking call did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockOutcome {
+    /// The caller's own condition was already satisfied, so nothing was blocked. The caller keeps
+    /// the CPU and should carry on (this is what makes a wake-up impossible to lose).
+    Ready,
     /// The caller is switched away and will resume when woken or its deadline passes.
     Blocked,
     /// The deadline had already passed, so nothing was waited for. Not an error.
@@ -597,6 +600,201 @@ pub fn block_until_tick(resource: u32, deadline_tick: u64) -> BlockOutcome {
     outcome
 }
 
+/// Block the current task **unless** `ready()` says the wait is already over.
+///
+/// `ready()` runs inside the *same* critical section that would mark the task blocked. That is the
+/// whole point: a waker either arrives before the section — the condition is then already true and
+/// nothing blocks — or after it, in which case the task is already `Blocked` and visible to the
+/// waker. A wake-up cannot fall into the gap.
+///
+/// A closure rather than a "check, then block" pair, deliberately: that two-step form is exactly
+/// how `sync::Mutex::lock` came to lose a wake-up and block forever on a lock that was already
+/// free. Everything built on top of this — `event::Signal`, `event::WaitQueue`, `event::park`, the
+/// async executor — inherits the property instead of re-deriving it.
+///
+/// `deadline_tick == 0` means "no deadline".
+pub fn block_until_tick_if(
+    resource: u32,
+    deadline_tick: u64,
+    ready: impl FnOnce() -> bool,
+) -> BlockOutcome {
+    let g = critical::enter();
+    let outcome = if ready() {
+        BlockOutcome::Ready
+    } else {
+        unsafe { mark_blocked_locked(resource, deadline_tick) }
+    };
+    drop(g);
+    outcome
+}
+
+/// Wake a specific task: set its wake flag, and make it runnable if it is blocked.
+///
+/// ISR-safe (short critical section, no allocation) and idempotent. It deliberately does **not**
+/// preempt: a woken task waits for its normal turn in the ring (design rule 1).
+///
+/// Task ids are never reused — `take_id` is monotonic — so a stale id either names the task it came
+/// from or names nothing at all. A waker that outlived its task therefore does nothing, which is
+/// why no generation counter is needed on this path.
+pub fn wake_task(id: u32) {
+    if id == 0 {
+        return;
+    }
+    let g = critical::enter();
+    unsafe {
+        let head = *KERNEL.ring_head.get();
+        if !head.is_null() {
+            let mut p = head;
+            loop {
+                if (*p).id == id {
+                    (*p).flags |= crate::tcb::TCB_FLAG_WOKEN;
+                    if (*p).state == TaskState::Blocked {
+                        (*p).state = TaskState::Ready;
+                        (*p).blocked_on = 0;
+                        (*p).block_deadline = 0;
+                    }
+                    break;
+                }
+                p = (*p).next;
+                if p.is_null() || p == head {
+                    break;
+                }
+            }
+        }
+    }
+    drop(g);
+}
+
+/// Consume the calling task's wake flag: `true` if a `wake_task` arrived and has not been taken.
+///
+/// # Safety
+/// Caller holds the kernel critical section. The flag read belongs to the *running* task, which is
+/// exactly what a blocking primitive wants to check before it blocks.
+pub unsafe fn take_wake_flag_locked() -> bool {
+    let me = KERNEL.current();
+    if me.is_null() {
+        return false;
+    }
+    let set = (*me).flags & crate::tcb::TCB_FLAG_WOKEN != 0;
+    (*me).flags &= !crate::tcb::TCB_FLAG_WOKEN;
+    set
+}
+
+/// Make the **first** task blocked on `resource` runnable, and say whether one was found. O(ring).
+///
+/// This is the single-waiter hand-off a `WaitQueue` needs. `wake_blocked_on` wakes everyone, which
+/// is right for a lock (they contend and one wins) and wrong for a queue (it would wake the whole
+/// line and hand every waiter a "signalled" that is not theirs).
+pub fn wake_first_blocked_on(resource: u32) -> bool {
+    let g = critical::enter();
+    let mut found = false;
+    unsafe {
+        let head = *KERNEL.ring_head.get();
+        if !head.is_null() {
+            let mut p = head;
+            loop {
+                if (*p).state == TaskState::Blocked && (*p).blocked_on == resource {
+                    (*p).flags |= crate::tcb::TCB_FLAG_WOKEN;
+                    (*p).state = TaskState::Ready;
+                    (*p).blocked_on = 0;
+                    (*p).block_deadline = 0;
+                    found = true;
+                    break;
+                }
+                p = (*p).next;
+                if p.is_null() || p == head {
+                    break;
+                }
+            }
+        }
+    }
+    drop(g);
+    found
+}
+
+/// How many tasks are blocked on `resource` right now. O(ring).
+pub fn blocked_on_count(resource: u32) -> usize {
+    let g = critical::enter();
+    let mut n = 0usize;
+    unsafe {
+        let head = *KERNEL.ring_head.get();
+        if !head.is_null() {
+            let mut p = head;
+            loop {
+                if (*p).state == TaskState::Blocked && (*p).blocked_on == resource {
+                    n += 1;
+                }
+                p = (*p).next;
+                if p.is_null() || p == head {
+                    break;
+                }
+            }
+        }
+    }
+    drop(g);
+    n
+}
+
+/// Give up the rest of the slice but stay `Ready`: the caller goes to the back of the round.
+///
+/// This is the "skip to the next task immediately" primitive. An `nb::WouldBlock`, a `Pending`
+/// future, an application polling a peripheral with no interrupt, or code that simply has nothing
+/// useful to do until its next turn all reduce to this call. It costs one switch and never blocks,
+/// so the caller stays runnable and cannot starve.
+///
+/// With nothing else runnable there is nowhere to yield to and the call is a no-op: the caller
+/// keeps its slice (the tick still fires) rather than spinning it away.
+pub fn yield_now() {
+    crate::arch::request_switch();
+}
+
+/// A task identity that stays meaningful after the task is gone.
+///
+/// Ids are monotonic and never reused (`take_id`), so a `TaskId` held by a waker either refers to
+/// the task it was taken from or to nothing at all. That is the whole safety story for stale
+/// wakers: no generation counter, no lookup table, and no way to wake a recycled TCB by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskId(u32);
+
+impl TaskId {
+    /// The raw id, as stored in the TCB. `0` means "no task".
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// True for the null id, which `current_id` returns outside a task.
+    pub const fn is_none(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// The calling task's id, or the null [`TaskId`] when called outside a task (interrupt or idle).
+pub fn current_id() -> TaskId {
+    TaskId(current_task_id())
+}
+
+/// Id allocator for `event` resources (`WaitQueue`), kept out of the task-id space.
+///
+/// Task ids start at 1 and grow with every spawn; resource ids start at `0x4000_0000`, so the two
+/// spaces cannot collide in any realistic lifetime. A critical-section counter rather than an
+/// `AtomicU32`, so the same code compiles on Cortex-M0 and AVR, which have no atomic
+/// read-modify-write at all.
+struct ResourceIds(UnsafeCell<u32>);
+
+// SAFETY: only touched inside `critical::enter`.
+unsafe impl Sync for ResourceIds {}
+
+static NEXT_RESOURCE_ID: ResourceIds = ResourceIds(UnsafeCell::new(0x4000_0000));
+
+/// Take a resource id for a new `event::WaitQueue`.
+pub fn alloc_resource_id() -> u32 {
+    let g = critical::enter();
+    let id = unsafe { *NEXT_RESOURCE_ID.0.get() };
+    unsafe { *NEXT_RESOURCE_ID.0.get() = id.wrapping_add(1) };
+    drop(g);
+    id
+}
+
 /// Block the calling task for **at least** `ticks` slice ticks.
 ///
 /// The deadline is computed *inside* the critical section. Reading the tick first and blocking
@@ -640,6 +838,9 @@ pub fn sleep_until_tick(deadline_tick: u64) {
     while tick_count() < deadline_tick {
         match block_until_tick(0, deadline_tick) {
             BlockOutcome::Blocked => {}
+            // `block_until_tick` has no condition, so it never reports this; the shared enum simply
+            // has to name it.
+            BlockOutcome::Ready => {}
             // Deadline passed while we were deciding: done.
             BlockOutcome::AlreadyPast => break,
             // Cannot block here at all; stop rather than spin.

@@ -44,6 +44,15 @@ pub enum TaskState {
 /// "main"/supervisor context on Cortex-M; see `arch::cortex_m`.
 pub const TCB_FLAG_USE_MSP: u8 = 1 << 0;
 
+/// `flags` bit: the task has been woken by `scheduler::wake_task` and its wake has not been
+/// consumed yet.
+///
+/// This is what makes `event::park` and the async `Waker` race-free without an extra field in the
+/// TCB: a `wake` that arrives *before* the task blocks is remembered here, and the blocking
+/// primitive's condition runs inside the same critical section that would block, so the flag can
+/// never be set in the gap between "checked" and "blocked".
+pub const TCB_FLAG_WOKEN: u8 = 1 << 1;
+
 /// Task Control Block.
 ///
 /// # ABI warning
