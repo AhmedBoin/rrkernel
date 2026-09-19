@@ -402,8 +402,9 @@ pub unsafe fn critical_exit(token: CriticalToken) {
 // Vectors and the switch
 // ---------------------------------------------------------------------------
 
-/// A trap we do not expect: the assembly parks on its own (`b .`), so nothing to
-/// do here.
+// A trap we do not expect: the assembly parks on its own (`b .`), so there is nothing to do
+// here. Deliberately a plain comment, not a doc comment: as `///` it documented no item, and
+// `clippy::empty_line_after_doc_comments` flagged exactly that.
 
 /// Spurious / "no eligible pending interrupt" codes returned by `GICC_IAR`.
 ///
@@ -658,7 +659,7 @@ pub fn retune_timer(_plan: crate::arch::TimerPlan) -> Result<(), ConfigError> {
 /// `sp` is left null: the IRQ entry stores it on the first switch away, and a
 /// switch *to* a task that was never switched away from cannot happen in a
 /// circular ring.
-pub fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError> {
+pub unsafe fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError> {
     unsafe {
         (*tcb).sp = core::ptr::null_mut();
         (*tcb).stack_base = core::ptr::null_mut();
@@ -668,7 +669,10 @@ pub fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError>
     Ok(())
 }
 
-pub fn create_task(tcb: *mut TaskControlBlock, stack_size: usize) -> Result<(), crate::SpawnError> {
+pub unsafe fn create_task(
+    tcb: *mut TaskControlBlock,
+    stack_size: usize,
+) -> Result<(), crate::SpawnError> {
     // 8-byte alignment padding, so an aligned frame base always fits.
     let size = stack_size.max(256) + 8;
     let block = {
@@ -750,18 +754,21 @@ pub fn shutdown(_code: i32) -> ! {
 /// the critical section (if any) has ended, instead of switching inline.
 pub fn request_switch() {
     unsafe {
-        // GICD_SGIR: target this CPU (0b01 << 24) and use SGI 0.
-        let sgir = (1 << 24) | 0;
+        // GICD_SGIR: bits 24..25 choose the targets — 0b01 = "this CPU only" — and bits 0..3
+        // carry the SGI id; the kernel's switch signal is SGI 0, so the id contributes nothing
+        // to the value. Spelled out in the comment rather than as `| 0` in the expression,
+        // which is what `clippy::identity_op` (rightly) refuses to let past review.
+        let sgir = 1u32 << 24;
         write_volatile(gicd(0xF00), sgir);
     }
 }
 
 /// Nothing to release: stacks and TCBs are arena blocks, freed by the same
 /// deferred-free pass.
-pub fn on_task_reclaimed(_tcb: *mut TaskControlBlock) {}
+pub unsafe fn on_task_reclaimed(_tcb: *mut TaskControlBlock) {}
 
 /// Nothing to pin: reclamation runs from the IRQ entry on the incoming task's
 /// stack, on a single CPU, with IRQs masked.
-pub fn is_pinned(_tcb: *mut TaskControlBlock) -> bool {
+pub unsafe fn is_pinned(_tcb: *mut TaskControlBlock) -> bool {
     false
 }

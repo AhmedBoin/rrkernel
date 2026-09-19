@@ -46,7 +46,7 @@ pub fn ticks_for(d: Duration) -> u64 {
     }
     let want = d.as_nanos();
     let slice = slice_ns as u128;
-    match (want + slice - 1) / slice {
+    match want.div_ceil(slice) {
         0 => 1,
         n if n > u64::MAX as u128 => u64::MAX,
         n => n as u64,

@@ -90,7 +90,7 @@ pub struct MutexHeader {
     owner: AtomicU32,
     /// Guards `owner` and the held-lock registry, with local interrupts masked.
     pub(crate) state: SpinLock,
-    /// Releases this mutex; monomorphised over `T` by [`Mutex`].
+    /// Releases this mutex: the type-erased [`release_shim`].
     pub(crate) release: fn(&MutexHeader),
 }
 
@@ -116,7 +116,7 @@ impl<T> Mutex<T> {
                 id: alloc_lock_id(),
                 owner: AtomicU32::new(0),
                 state: SpinLock::new(),
-                release: release_shim::<T>,
+                release: release_shim,
             },
             data: UnsafeCell::new(data),
         }
@@ -132,7 +132,7 @@ impl<T> Mutex<T> {
                 id,
                 owner: AtomicU32::new(0),
                 state: SpinLock::new(),
-                release: release_shim::<T>,
+                release: release_shim,
             },
             data: UnsafeCell::new(data),
         }
@@ -290,8 +290,13 @@ impl<T> Drop for MutexGuard<'_, T> {
     }
 }
 
-/// The monomorphised release used by the type-erased registry.
-fn release_shim<T>(header: &MutexHeader) {
+/// The type-erased release stored in [`MutexHeader::release`].
+///
+/// Deliberately **not** generic: releasing touches only the header — the owner word, the
+/// held-lock registry and the wake-up walk — so there is nothing to monomorphise over `T`.
+/// It used to be `release_shim::<T>`, which clippy flagged as an unused type parameter and
+/// which implied per-type behaviour that does not exist.
+fn release_shim(header: &MutexHeader) {
     {
         let _g = header.state.lock();
         header.owner.store(0, Ordering::Relaxed);
@@ -308,7 +313,7 @@ fn ms_to_ticks(ms: u64) -> u64 {
     if slice_ns == 0 {
         return ms;
     }
-    (ms.saturating_mul(1_000_000) + slice_ns - 1) / slice_ns
+    ms.saturating_mul(1_000_000).div_ceil(slice_ns)
 }
 
 /// A deterministic pseudo-random back-off, in ticks.

@@ -45,7 +45,7 @@ fn main() {
         loop {
             n = n.wrapping_add(1);
             core::hint::spin_loop();
-            if n % 200_000_000 == 0 {
+            if n.is_multiple_of(200_000_000) {
                 eprintln!("[smoke] still spinning (n = {n})");
             }
         }

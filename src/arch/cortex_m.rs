@@ -526,7 +526,7 @@ unsafe fn push(sp: &mut *mut u32, value: u32) {
 /// that save has already happened. (A switch *to* a task that was never switched
 /// away from is impossible: the ring is circular, so returning to a task
 /// requires having left it.)
-pub fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError> {
+pub unsafe fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError> {
     unsafe {
         (*tcb).flags = TCB_FLAG_USE_MSP;
         (*tcb).stack_base = core::ptr::null_mut();
@@ -538,7 +538,10 @@ pub fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError>
 
 /// Build a fresh task: stack from the kernel arena plus an initial exception
 /// frame whose program counter is [`crate::trampoline::task_trampoline`].
-pub fn create_task(tcb: *mut TaskControlBlock, stack_size: usize) -> Result<(), crate::SpawnError> {
+pub unsafe fn create_task(
+    tcb: *mut TaskControlBlock,
+    stack_size: usize,
+) -> Result<(), crate::SpawnError> {
     // Worst-case alignment padding, so the 8-byte-aligned top is always inside
     // the block.
     let size = stack_size.max(256) + 8;
@@ -621,10 +624,10 @@ pub fn shutdown(_code: i32) -> ! {
 
 /// No per-task OS resources to release on bare metal: the stack and TCB are both
 /// arena blocks and are freed by the same deferred-free pass.
-pub fn on_task_reclaimed(_tcb: *mut TaskControlBlock) {}
+pub unsafe fn on_task_reclaimed(_tcb: *mut TaskControlBlock) {}
 
 /// Bare metal has no second thread, so nothing needs pinning: the reclaimer only
 /// ever runs from `PendSV`, on the kernel stack, after the switch.
-pub fn is_pinned(_tcb: *mut TaskControlBlock) -> bool {
+pub unsafe fn is_pinned(_tcb: *mut TaskControlBlock) -> bool {
     false
 }

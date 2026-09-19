@@ -90,6 +90,12 @@ impl ArenaCell {
     pub const LEN: usize = DEFAULT_ARENA_SIZE;
 }
 
+impl Default for ArenaCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The process-wide default arena.
 pub static DEFAULT_ARENA: ArenaCell = ArenaCell::new();
 
@@ -288,5 +294,5 @@ fn align_up(v: *mut u8, align: usize) -> *mut u8 {
 }
 
 /// Compile-time sanity: the header must be usable as a pointer target.
-const _: () = assert!(HDR_SIZE % core::mem::align_of::<Block>() == 0);
+const _: () = assert!(HDR_SIZE.is_multiple_of(core::mem::align_of::<Block>()));
 const _: () = assert!(HDR_SIZE >= core::mem::size_of::<Block>());

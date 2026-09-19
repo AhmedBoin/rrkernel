@@ -20,15 +20,19 @@ unsafe fn critical_enter() -> CriticalToken;
 unsafe fn critical_exit(token: CriticalToken);
 
 // --- task construction ------------------------------------------------------
-fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError>;
-fn create_task(tcb: *mut TaskControlBlock, stack_size: usize) -> Result<(), SpawnError>;
+// `unsafe`: the pointer comes from the kernel, and the contract — a live, arena-allocated
+// TCB plus kernel context — is the caller's to uphold. Until this was written down in the
+// signature, `rrkernel::arch::create_task(wild_pointer, 0)` was callable from *safe* code
+// (the module is re-exported), which is a soundness hole rather than a style choice.
+unsafe fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError>;
+unsafe fn create_task(tcb: *mut TaskControlBlock, stack_size: usize) -> Result<(), SpawnError>;
 
 // --- the switch -------------------------------------------------------------
 fn request_switch();                      // switch ASAP + restart the slice
 fn exit_current_task_forever() -> !;      // what a finished task does
 fn idle_forever() -> !;                   // nothing runnable
-fn on_task_reclaimed(tcb: *mut TaskControlBlock);
-fn is_pinned(tcb: *mut TaskControlBlock) -> bool;
+unsafe fn on_task_reclaimed(tcb: *mut TaskControlBlock);
+unsafe fn is_pinned(tcb: *mut TaskControlBlock) -> bool;
 fn mark_running();
 fn shutdown(code: i32) -> !;
 ```

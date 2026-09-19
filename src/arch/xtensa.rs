@@ -1402,7 +1402,7 @@ pub fn retune_timer(_plan: crate::arch::TimerPlan) -> Result<(), ConfigError> {
 /// left null because the trap entry writes it on the first switch away, and a
 /// switch *to* a task that was never switched away from cannot happen in a
 /// circular ring.
-pub fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError> {
+pub unsafe fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError> {
     unsafe {
         (*tcb).sp = core::ptr::null_mut();
         (*tcb).stack_base = core::ptr::null_mut();
@@ -1412,7 +1412,10 @@ pub fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError>
     Ok(())
 }
 
-pub fn create_task(tcb: *mut TaskControlBlock, stack_size: usize) -> Result<(), crate::SpawnError> {
+pub unsafe fn create_task(
+    tcb: *mut TaskControlBlock,
+    stack_size: usize,
+) -> Result<(), crate::SpawnError> {
     // Worst-case 16-byte alignment padding, plus room for the frame itself.
     let size = stack_size.max(512) + FRAME_SIZE + 16;
     let block = {
@@ -1491,10 +1494,10 @@ pub fn shutdown(_code: i32) -> ! {
 
 /// Nothing to release: the stack and the TCB are both arena blocks, freed by the
 /// same deferred-free pass.
-pub fn on_task_reclaimed(_tcb: *mut TaskControlBlock) {}
+pub unsafe fn on_task_reclaimed(_tcb: *mut TaskControlBlock) {}
 
 /// Nothing to pin: reclamation runs from the trap entry on the incoming task's
 /// stack, on a single core, with interrupts masked.
-pub fn is_pinned(_tcb: *mut TaskControlBlock) -> bool {
+pub unsafe fn is_pinned(_tcb: *mut TaskControlBlock) -> bool {
     false
 }

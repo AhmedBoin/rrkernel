@@ -504,7 +504,7 @@ pub fn retune_timer(plan: crate::arch::TimerPlan) -> Result<(), ConfigError> {
 /// The calling thread becomes task 0. Fibres share the thread, so there is no
 /// stack to allocate: the handler saves task 0's context on its first switch
 /// away, exactly as `PendSV` does on Cortex-M.
-pub fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError> {
+pub unsafe fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError> {
     unsafe {
         (*tcb).sp = ptr::null_mut();
         (*tcb).stack_base = ptr::null_mut();
@@ -522,7 +522,10 @@ fn rrkernel_task_start_addr() -> usize {
     rrkernel_task_start as *const () as usize
 }
 
-pub fn create_task(tcb: *mut TaskControlBlock, stack_size: usize) -> Result<(), crate::SpawnError> {
+pub unsafe fn create_task(
+    tcb: *mut TaskControlBlock,
+    stack_size: usize,
+) -> Result<(), crate::SpawnError> {
     // 16-byte alignment for the ABI, plus 16 so the frame can be padded to keep
     // `rsp % 16 == 8` at the task entry (the state the ABI expects after a
     // `call`). The floor is 8 KiB: a fibre stack also has to host the signal
@@ -604,10 +607,10 @@ pub fn shutdown(code: i32) -> ! {
     std::process::exit(code)
 }
 
-pub fn on_task_reclaimed(_tcb: *mut TaskControlBlock) {}
+pub unsafe fn on_task_reclaimed(_tcb: *mut TaskControlBlock) {}
 
 /// Nothing to pin: reclamation runs after the switch, on the *incoming* fibre's
 /// stack, so a finishing task's stack is never in use when it is freed.
-pub fn is_pinned(_tcb: *mut TaskControlBlock) -> bool {
+pub unsafe fn is_pinned(_tcb: *mut TaskControlBlock) -> bool {
     false
 }

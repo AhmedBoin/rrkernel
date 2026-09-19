@@ -181,11 +181,13 @@ mod word_ops {
 
     /// Held-state test, for the contended path's back-off.
     #[inline]
+    #[allow(dead_code)] // SMP surface: the contended back-off path does not consult it yet
     pub fn lock_is_held(word: &LockWord) -> bool {
         word.load(Ordering::Relaxed)
     }
 
     #[inline]
+    #[allow(dead_code)] // SMP surface; symmetrical with `bool_ops` above
     pub fn lock_clear(word: &LockWord) {
         word.store(false, Ordering::Relaxed)
     }
@@ -206,11 +208,13 @@ mod word_ops {
 
     /// Held-state test, for the contended path's back-off.
     #[inline]
+    #[allow(dead_code)] // SMP surface: the contended back-off path does not consult it yet
     pub fn lock_is_held(word: &LockWord) -> bool {
         word.load(Ordering::Relaxed) != 0
     }
 
     #[inline]
+    #[allow(dead_code)] // SMP surface; symmetrical with the ARMv6-M `bool_ops` above
     pub fn lock_clear(word: &LockWord) {
         word.store(0, Ordering::Relaxed)
     }
@@ -249,6 +253,12 @@ impl SpinLock {
         let irq = unsafe { crate::arch::critical_enter() };
         <Native as CpuArch>::spinlock_acquire(&self.word);
         SpinGuard { lock: self, irq }
+    }
+}
+
+impl Default for SpinLock {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

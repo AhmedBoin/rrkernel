@@ -132,10 +132,19 @@ const MIN_SLICE_NS_FALLBACK: u64 = 1_000_000;
 static LOCK_OWNER: AtomicU32 = AtomicU32::new(0);
 static LOCK_DEPTH: AtomicU32 = AtomicU32::new(0);
 
-/// Token returned by [`critical_enter`]. On this backend the lock is global
-/// and recursive, so the token carries no state — but it keeps the
-/// `critical::CriticalGuard` API identical to the interrupt-masking backends.
-pub type CriticalToken = ();
+/// Token returned by [`critical_enter`].
+///
+/// On this backend the critical section is a **global recursive spinlock**, so unlike the
+/// interrupt-masking ports there is no interrupt state to save and no state to restore:
+/// leaving the section is a depth decrement. The token is therefore the **nesting depth this
+/// section added**, which is the one piece of per-entry state that really exists here, rather
+/// than `()`.
+///
+/// That keeps the port surface uniform (`docs/PORTING.md` documents each backend's token
+/// meaning) without pretending a saved `PRIMASK` exists, and it removes a unit value that
+/// otherwise had to travel through `critical::CriticalGuard`, `smp::IrqToken` and every
+/// `SpinLock` guard in the kernel.
+pub type CriticalToken = u32;
 
 /// Enter the kernel critical section.
 ///
@@ -145,8 +154,7 @@ pub type CriticalToken = ();
 pub unsafe fn critical_enter() -> CriticalToken {
     let me = GetCurrentThreadId().wrapping_add(1);
     if LOCK_OWNER.load(Ordering::Acquire) == me {
-        LOCK_DEPTH.fetch_add(1, Ordering::Relaxed);
-        return ();
+        return LOCK_DEPTH.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     }
     let mut spins: u64 = 0;
     loop {
@@ -155,7 +163,7 @@ pub unsafe fn critical_enter() -> CriticalToken {
             .is_ok()
         {
             LOCK_DEPTH.store(1, Ordering::Relaxed);
-            return ();
+            return 1;
         }
         spins += 1;
         if spins & 0xFF == 0 {
@@ -176,6 +184,9 @@ pub unsafe fn critical_enter() -> CriticalToken {
 }
 
 /// Leave the kernel critical section.
+///
+/// The token is not consulted: see [`CriticalToken`] — releasing is a depth decrement, and
+/// the ownership word is cleared only when the outermost section on this thread ends.
 ///
 /// # Safety
 /// Must be called exactly once per [`critical_enter`] on the same thread.
@@ -540,7 +551,13 @@ pub fn retune_timer(plan: TimerPlan) -> Result<(), ConfigError> {
     Ok(())
 }
 
-pub fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError> {
+// `unsafe fn` is the honest signature for the whole port surface: the pointers arrive from the
+// kernel, and the contract — a live, arena-allocated TCB, in kernel context — is stated once in
+// `docs/PORTING.md`. Keeping every port identical here is the point: a per-target variation
+// would be invisible to whoever writes the next port. Clippy's `not_unsafe_ptr_arg_deref` was
+// right to complain, by the way — `rrkernel::arch` is re-exported, so before this change
+// `arch::create_task(wild_pointer, 0)` was callable from *safe* code and would dereference it.
+pub unsafe fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError> {
     unsafe {
         // A real handle (not the GetCurrentThread pseudo-handle) so the tick
         // thread can suspend/resume it like any other task.
@@ -562,7 +579,10 @@ pub fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError>
     Ok(())
 }
 
-pub fn create_task(tcb: *mut TaskControlBlock, stack_size: usize) -> Result<(), crate::SpawnError> {
+pub unsafe fn create_task(
+    tcb: *mut TaskControlBlock,
+    stack_size: usize,
+) -> Result<(), crate::SpawnError> {
     unsafe {
         // Windows rounds thread stacks up to its own granularity and 4 KiB is
         // not a workable real thread stack, so small requests are raised here
@@ -613,7 +633,7 @@ pub fn mark_running() {}
 /// when it switched away from the task; this is the safety net for a task that
 /// died without ever being switched away from (or on an error path), so a
 /// long-running host program that spawns tasks in a loop cannot leak handles.
-pub fn on_task_reclaimed(tcb: *mut TaskControlBlock) {
+pub unsafe fn on_task_reclaimed(tcb: *mut TaskControlBlock) {
     unsafe {
         let h = (*tcb).backend as Handle;
         (*tcb).backend = ptr::null_mut();
@@ -630,7 +650,7 @@ pub fn on_task_reclaimed(tcb: *mut TaskControlBlock) {
 /// still holding as "the task I last resumed" must not be recycled, because the
 /// next switch needs its `backend` handle to suspend it and, if it is finished,
 /// to close that handle.
-pub fn is_pinned(tcb: *mut TaskControlBlock) -> bool {
+pub unsafe fn is_pinned(tcb: *mut TaskControlBlock) -> bool {
     let v = RUNNING_TCB.load(Ordering::Acquire);
     v != 0 && v == tcb as usize
 }
