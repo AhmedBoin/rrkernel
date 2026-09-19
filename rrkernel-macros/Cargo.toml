@@ -2,9 +2,13 @@
 name = "rrkernel-macros"
 version = "0.2.0"
 edition = "2021"
-description = "Attribute macros for rrkernel: #[rrkernel] turns a cortex-m-rt entry point into task 0, configures nothing you did not ask for, and installs the kernel's fault and panic handlers."
+rust-version = "1.88"
+description = "Attribute macros for rrkernel: #[rrkernel] turns a cortex-m-rt entry point into task 0, configures the kernel, and installs the fault and panic handlers."
 license = "MIT"
-publish = false
+repository = "https://github.com/AhmedBoin/rrkernel"
+documentation = "https://docs.rs/rrkernel-macros"
+keywords = ["rtos", "embedded", "cortex-m", "macro"]
+categories = ["embedded", "no-std"]
 
 [lib]
 proc-macro = true

@@ -6,9 +6,27 @@ rust-version = "1.88"
 authors = ["Mohamed A.Taha <ahmed.boin@gmail.com>"]
 description = "Preemptive round-robin RTOS kernel: one API for bare-metal Cortex-M (SysTick+PendSV, cycle-exact slices) and std desktops, with an optional #[rrkernel] attribute that makes main() task 0."
 license = "MIT"
+repository = "https://github.com/AhmedBoin/rrkernel"
+documentation = "https://docs.rs/rrkernel"
 readme = "README.md"
 keywords = ["rtos", "no_std", "embedded", "cortex-m", "scheduler"]
 categories = ["embedded", "no-std", "concurrency"]
+# What does not belong in the published crate: the sibling workspace packages (they are separate
+# packages with their own `path` dependencies), the QEMU tooling, and the CI config. The example
+# *sources* at `examples/*.rs` are deliberately kept — the manifest declares them as targets.
+exclude = [
+    "examples/cortex-m-bluepill/",
+    "examples/cortex-m-blackpill/",
+    "firmware-cortex-m/",
+    "firmware-riscv/",
+    "firmware-arm-a/",
+    "firmware-esp32/",
+    "firmware-common/",
+    "tools/",
+    "scripts/",
+    "avr-specs/",
+    ".github/",
+]
 
 [lib]
 name = "rrkernel"
@@ -48,7 +66,7 @@ macros = ["dep:rrkernel-macros"]
 
 [dependencies]
 # See `macros` above. The proc-macro crate only ever runs in the compiler.
-rrkernel-macros = { path = "rrkernel-macros", optional = true }
+rrkernel-macros = { path = "rrkernel-macros", version = "0.2.0", optional = true }
 
 # --- The embedded ecosystem traits -----------------------------------------
 # `embedded-hal`, `embedded-hal-async`, `embedded-io` and `embedded-io-async` are **always**
