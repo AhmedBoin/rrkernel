@@ -184,6 +184,14 @@ impl Arena {
                     (*prev).next = next;
                 }
                 (*cur).next = ptr::null_mut();
+                // `total` is the block's capacity and is fixed at carve time, but
+                // `payload_size` must be updated to the *new* request: `free` reads this
+                // field to decrement `live`, so leaving the original value here makes the
+                // live-byte accounting drift by the size difference on every recycle at a
+                // different size — i.e. under any realistic mixed spawn/exit workload.
+                // Not a memory-safety issue (`total` is what bounds the payload) but the
+                // stats would be wrong.
+                (*cur).payload_size = size;
                 *((payload.sub(PTR_SLOT)) as *mut *mut Block) = cur;
                 self.account_alloc(size);
                 return Some(payload);

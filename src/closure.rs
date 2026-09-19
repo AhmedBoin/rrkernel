@@ -80,8 +80,12 @@ pub unsafe fn run(base: *mut u8) {
     debug_assert!(!base.is_null(), "task trampoline got a null closure block");
     let hdr = &*(base as *const ClosureHeader);
     let data = base.add(hdr.data_off);
-    // Poison the header so a double-run trips immediately instead of
-    // re-running on freed memory.
+    // NOTE: the header is *not* poisoned afterwards. A second call would re-enter
+    // `run_closure::<F>` and `ptr::read` a value that has already been moved out — and,
+    // in the normal lifecycle, freed back to the arena — so it would be a use-after-move
+    // rather than a caught error. The safety contract above ("has not run yet") is the
+    // only thing preventing that, deliberately: no runtime check is added here because
+    // this runs once per task on every target, hot path included.
     (hdr.run)(data);
 }
 

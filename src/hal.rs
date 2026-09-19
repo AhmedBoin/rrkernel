@@ -126,13 +126,25 @@ mod shared {
         LockTimeout,
         /// Taking this lock would invert the kernel's static lock order (see [`crate::sync::Mutex`]).
         LockOrder,
+        /// The caller already holds the maximum number of locks the kernel tracks per task
+        /// ([`crate::sync::MAX_HELD_LOCKS`]), so this one could not be recorded and was **not**
+        /// taken. Not an ordering problem: nothing is out of order, the task is simply nested
+        /// deeper than the kernel can track.
+        TooManyLocks,
     }
 
     impl<E> From<LockError> for SharedError<E> {
         fn from(e: LockError) -> Self {
             match e {
                 LockError::Timeout => SharedError::LockTimeout,
-                _ => SharedError::LockOrder,
+                // Structural refusals keep their identity: a caller that asked for a timeout and
+                // got a depth limit must not have to read "lock order" and guess.
+                LockError::OrderViolation { .. } => SharedError::LockOrder,
+                LockError::TooManyHeldLocks => SharedError::TooManyLocks,
+                // Not distinguishable through this API: both mean the call came from a context
+                // that cannot hold a lock at all (no running scheduler, or a re-entrant
+                // acquisition), which through a device facade is a programming error.
+                LockError::NotRunning | LockError::AlreadyOwnedBySelf => SharedError::LockOrder,
             }
         }
     }
@@ -140,9 +152,9 @@ mod shared {
     // `embedded_hal`'s error types are marker traits that also ask for a kind.
     impl<E: core::fmt::Debug> embedded_hal::i2c::Error for SharedError<E> {
         fn kind(&self) -> embedded_hal::i2c::ErrorKind {
-            // `Other` for all three on purpose: "the lock timed out" and "this would invert the lock
-            // order" are not bus conditions, and inventing a bus kind for them would be a lie the
-            // next reader has to un-learn.
+            // `Other` for every variant on purpose: "the lock timed out", "this would invert the
+            // lock order" and "you are nested too deep" are not bus conditions, and inventing a
+            // bus kind for them would be a lie the next reader has to un-learn.
             embedded_hal::i2c::ErrorKind::Other
         }
     }

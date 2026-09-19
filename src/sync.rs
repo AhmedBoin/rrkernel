@@ -10,7 +10,11 @@
 //! * **Lock ordering is enforced, not documented.** Each task records the ids of the
 //!   locks it holds; acquiring a lock whose id is not *greater* than the last one held is
 //!   refused with [`LockError::OrderViolation`]. A program that creates locks in the
-//!   order it takes them therefore cannot form a circular wait.
+//!   order it takes them therefore cannot form a circular wait. Nesting deeper than
+//!   [`MAX_HELD_LOCKS`] is refused as well ([`LockError::TooManyHeldLocks`]), because a
+//!   lock that cannot be *recorded* would escape both this rule and the recovery path
+//!   below — the guarantee holds up to that depth, and past it you get an error, not a
+//!   quiet hole in the rule.
 //! * **[`Mutex::try_lock_for`] bounds the wait**, and [`Mutex::lock_with_backoff`]
 //!   implements the runtime recovery: release everything held, back off, retry.
 //!
@@ -61,6 +65,12 @@ pub enum LockError {
     AlreadyOwnedBySelf,
     /// The scheduler is not running, so no task can block (called before init).
     NotRunning,
+    /// The caller already holds [`MAX_HELD_LOCKS`] locks, so this one cannot be recorded.
+    /// Refused rather than silently granted: an untracked lock would escape
+    /// [`release_all_held_locks`] (the back-off recovery path would not free it) and would
+    /// make every later ordering check compare against the wrong "last held" lock,
+    /// silently disabling the deadlock-order guarantee from that point on.
+    TooManyHeldLocks,
 }
 
 impl core::fmt::Display for LockError {
@@ -75,6 +85,11 @@ impl core::fmt::Display for LockError {
             ),
             LockError::AlreadyOwnedBySelf => write!(f, "lock already held by this task"),
             LockError::NotRunning => write!(f, "scheduler not running"),
+            LockError::TooManyHeldLocks => write!(
+                f,
+                "cannot acquire: already holding the maximum of {} locks",
+                MAX_HELD_LOCKS
+            ),
         }
     }
 }
@@ -416,8 +431,17 @@ unsafe fn held_check_order(id: LockId) -> Result<(), LockError> {
         return Ok(());
     }
     let n = (*me).held_count as usize;
-    if n == 0 || n > MAX_HELD_LOCKS {
+    if n == 0 {
         return Ok(());
+    }
+    // At capacity there is no room to *record* another lock, and recording is not
+    // optional: `held_locks` is what the next ordering check compares against and what
+    // `release_all_held_locks` walks. Granting the lock while dropping the record would
+    // succeed at taking the lock and then quietly stop enforcing the order — the exact
+    // failure this rule exists to prevent. Refuse instead, so the depth limit is a
+    // reported error rather than a silent hole in the guarantee.
+    if n >= MAX_HELD_LOCKS {
+        return Err(LockError::TooManyHeldLocks);
     }
     let last = LockId((*me).held_locks[n - 1]);
     if id.0 <= last.0 {
@@ -435,6 +459,13 @@ unsafe fn held_push(id: LockId) {
         return;
     }
     let n = (*me).held_count as usize;
+    // `held_check_order` has already refused acquisitions at capacity, so `n <
+    // MAX_HELD_LOCKS` here. Re-checked rather than assumed (and asserted in debug) so
+    // that no future change to the call order can turn this into a silent drop again.
+    debug_assert!(
+        n < MAX_HELD_LOCKS,
+        "rrkernel: held_push at capacity; held_check_order should have refused first"
+    );
     if n < MAX_HELD_LOCKS {
         (*me).held_locks[n] = id.0;
         (*me).held_count = (n + 1) as u8;
