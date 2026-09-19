@@ -231,12 +231,7 @@ unsafe fn ensure_objects() {
         );
         if timer.is_null() {
             HIGH_RES.store(2, Ordering::Release);
-            timer = CreateWaitableTimerExW(
-                ptr::null_mut(),
-                ptr::null(),
-                0,
-                TIMER_ALL_ACCESS,
-            );
+            timer = CreateWaitableTimerExW(ptr::null_mut(), ptr::null(), 0, TIMER_ALL_ACCESS);
         } else {
             HIGH_RES.store(1, Ordering::Release);
         }

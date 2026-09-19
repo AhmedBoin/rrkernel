@@ -289,7 +289,11 @@ fn observer(observe_ticks: u32, exit: fn(i32) -> !) {
         && st.slice_cycles > 0;
 
     log!("\r\n--- report ------------------------------------------------\r\n");
-    log!("slice    : {} ticks ({} ns)\r\n", st.slice_cycles, st.slice_ns);
+    log!(
+        "slice    : {} ticks ({} ns)\r\n",
+        st.slice_cycles,
+        st.slice_ns
+    );
     log!(
         "threads  : total {} active {} reclaimed {}\r\n",
         st.total_threads,

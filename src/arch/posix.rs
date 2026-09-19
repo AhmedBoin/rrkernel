@@ -557,7 +557,7 @@ pub fn create_task(tcb: *mut TaskControlBlock, stack_size: usize) -> Result<(), 
         // doing any FP arithmetic.
         ptr::write_volatile(frame as *mut u32, 0x0000_1F80); // MXCSR
         ptr::write_volatile(frame.add(4) as *mut u16, 0x037F); // x87 control word
-        // [16..64) r15, r14, r13, r12, rbx, rbp — only r12 matters here.
+                                                               // [16..64) r15, r14, r13, r12, rbx, rbp — only r12 matters here.
         ptr::write_volatile(frame.add(40) as *mut usize, tcb as usize);
         // [64..72) return address: what the first switch "returns" into.
         ptr::write_volatile(frame.add(64) as *mut usize, rrkernel_task_start_addr());

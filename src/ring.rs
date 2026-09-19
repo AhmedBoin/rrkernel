@@ -26,7 +26,10 @@ pub unsafe fn insert_after(current: *mut TaskControlBlock, node: *mut TaskContro
         return;
     }
     let after = (*current).next;
-    debug_assert!(!after.is_null(), "ring invariant: linked node has a successor");
+    debug_assert!(
+        !after.is_null(),
+        "ring invariant: linked node has a successor"
+    );
     (*node).prev = current;
     (*node).next = after;
     (*current).next = node;

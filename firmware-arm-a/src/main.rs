@@ -118,9 +118,7 @@ impl Console for Pl011 {
     }
 }
 
-static CONSOLE: Pl011 = Pl011 {
-    base: 0x0900_0000,
-};
+static CONSOLE: Pl011 = Pl011 { base: 0x0900_0000 };
 
 /// Print through this firmware's UART, bypassing the demo's console slot (which
 /// does not exist until `rrkernel_demo::run` starts).

@@ -264,7 +264,10 @@ static TRAP_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 
 /// Install a trap-observation hook (see [`TrapEvent`]).
 pub fn set_trap_hook(hook: fn(TrapEvent)) {
-    TRAP_HOOK.store(hook as *const () as usize, core::sync::atomic::Ordering::Relaxed);
+    TRAP_HOOK.store(
+        hook as *const () as usize,
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Remove the hook.
@@ -330,7 +333,6 @@ unsafe extern "C" fn rrkernel_trap_switch(mcause: usize) -> *mut TaskControlBloc
     });
     next
 }
-
 
 /// Runs **after** the switch, i.e. on the incoming task's stack, so it can both
 /// reclaim the outgoing task's memory and restart the slice counter.
@@ -658,7 +660,10 @@ pub fn create_task(tcb: *mut TaskControlBlock, stack_size: usize) -> Result<(), 
         // a0 = the trampoline's argument (the TCB itself).
         w(OFF_A0, tcb as usize);
         // Where `mret` starts executing, and with what machine state.
-        w(OFF_MEPC, crate::trampoline::task_trampoline as *const () as usize);
+        w(
+            OFF_MEPC,
+            crate::trampoline::task_trampoline as *const () as usize,
+        );
         w(OFF_MSTATUS, MSTATUS_TASK_ENTRY);
 
         (*tcb).sp = frame;

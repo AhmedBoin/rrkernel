@@ -269,10 +269,7 @@ macro_rules! app {
             let started =
                 cortex_m::interrupt::free(|_cs| $crate::app_support::init($clock, $slice, $stack));
             if let Err(e) = started {
-                $crate::app_support::log_fmt(format_args!(
-                    "rrkernel: init failed: {:?}\r\n",
-                    e
-                ));
+                $crate::app_support::log_fmt(format_args!("rrkernel: init failed: {:?}\r\n", e));
                 // Also halt the debugger: if the application's own log sink is not up
                 // yet, this is still unmissable with a probe attached — and without one
                 // it faults into the handler below rather than pretending all is well.

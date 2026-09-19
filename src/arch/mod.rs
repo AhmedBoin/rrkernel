@@ -72,17 +72,9 @@ compile_error!(
 // --- bare metal ------------------------------------------------------------
 
 // ARM Cortex-M (M-profile: thumbv6m, thumbv7m, thumbv8m.main, ...).
-#[cfg(all(
-    not(feature = "std"),
-    target_arch = "arm",
-    target_feature = "mclass"
-))]
+#[cfg(all(not(feature = "std"), target_arch = "arm", target_feature = "mclass"))]
 mod cortex_m;
-#[cfg(all(
-    not(feature = "std"),
-    target_arch = "arm",
-    target_feature = "mclass"
-))]
+#[cfg(all(not(feature = "std"), target_arch = "arm", target_feature = "mclass"))]
 pub use cortex_m::*;
 
 // ARM A/R profile (armv7a-none-eabi, armv7r-none-eabi, armv8r-none-eabihf, ...):
@@ -162,9 +154,6 @@ compile_error!(
 mod xtensa;
 #[cfg(all(not(feature = "std"), target_arch = "xtensa"))]
 pub use xtensa::*;
-
-
-
 
 #[cfg(all(feature = "std", not(any(target_os = "windows", unix))))]
 compile_error!(

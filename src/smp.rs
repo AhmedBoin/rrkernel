@@ -351,10 +351,18 @@ impl CpuArch for RiscvArch {
 
 /// ARM A/R profile: `MPIDR` for identity, `LDREXB`/`STREXB` for the interlock (Rust
 /// lowers `AtomicBool` to exactly those), GICv2 `SGIR` for kicks.
-#[cfg(all(not(feature = "std"), target_arch = "arm", not(target_feature = "mclass")))]
+#[cfg(all(
+    not(feature = "std"),
+    target_arch = "arm",
+    not(target_feature = "mclass")
+))]
 pub struct ArmArch;
 
-#[cfg(all(not(feature = "std"), target_arch = "arm", not(target_feature = "mclass")))]
+#[cfg(all(
+    not(feature = "std"),
+    target_arch = "arm",
+    not(target_feature = "mclass")
+))]
 impl CpuArch for ArmArch {
     fn current_core_id() -> usize {
         let mpidr: u32;
@@ -451,18 +459,10 @@ impl CpuArch for XtensaArch {
 ///
 /// M-profile only — ARM A/R has [`ArmArch`], and letting both match would define
 /// `Native` twice.
-#[cfg(all(
-    not(feature = "std"),
-    target_arch = "arm",
-    target_feature = "mclass"
-))]
+#[cfg(all(not(feature = "std"), target_arch = "arm", target_feature = "mclass"))]
 pub struct SingleCoreArch;
 
-#[cfg(all(
-    not(feature = "std"),
-    target_arch = "arm",
-    target_feature = "mclass"
-))]
+#[cfg(all(not(feature = "std"), target_arch = "arm", target_feature = "mclass"))]
 impl CpuArch for SingleCoreArch {
     fn current_core_id() -> usize {
         0
@@ -554,13 +554,13 @@ impl CpuArch for HostArch {
 pub type Native = HostArch;
 #[cfg(all(not(feature = "std"), target_arch = "riscv32"))]
 pub type Native = RiscvArch;
-#[cfg(all(not(feature = "std"), target_arch = "arm", not(target_feature = "mclass")))]
-pub type Native = ArmArch;
-#[cfg(all(not(feature = "std"), target_arch = "xtensa"))]
-pub type Native = XtensaArch;
 #[cfg(all(
     not(feature = "std"),
     target_arch = "arm",
-    target_feature = "mclass"
+    not(target_feature = "mclass")
 ))]
+pub type Native = ArmArch;
+#[cfg(all(not(feature = "std"), target_arch = "xtensa"))]
+pub type Native = XtensaArch;
+#[cfg(all(not(feature = "std"), target_arch = "arm", target_feature = "mclass"))]
 pub type Native = SingleCoreArch;

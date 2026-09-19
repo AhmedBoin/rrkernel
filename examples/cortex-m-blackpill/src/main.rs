@@ -102,7 +102,12 @@ fn main() {
         st.active_threads,
         st.reclaimed
     );
-    rprintln!("ticks    : {} switches {} (slept {} ms)", st.ticks, st.switches, slept);
+    rprintln!(
+        "ticks    : {} switches {} (slept {} ms)",
+        st.ticks,
+        st.switches,
+        slept
+    );
     rprintln!(
         "accuracy : worst switch {} cycles (DWT), worst period error {} ns",
         st.worst_latency,

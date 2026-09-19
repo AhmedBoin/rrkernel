@@ -11,7 +11,10 @@
 use rrkernel::{scheduler, thread, IdlePolicy, SchedulerConfig, Slice};
 
 fn main() {
-    eprintln!("[smoke] platform: {}", scheduler::platform_limits().timer_note);
+    eprintln!(
+        "[smoke] platform: {}",
+        scheduler::platform_limits().timer_note
+    );
 
     let cfg = SchedulerConfig {
         slice: Slice::Millis(1),

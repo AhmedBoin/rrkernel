@@ -8,7 +8,7 @@
 //! does register/stack mechanics, Rust does policy.
 
 use crate::arena::{Arena, ArenaStats, DEFAULT_ARENA};
-use crate::config::{ConfigError, PlatformLimits, Slice, SchedulerConfig};
+use crate::config::{ConfigError, PlatformLimits, SchedulerConfig, Slice};
 use crate::critical;
 use crate::ring;
 use crate::tcb::{KernelConfig, TaskControlBlock, TaskState, KERNEL};
@@ -589,7 +589,9 @@ unsafe fn wake_expired() {
     }
     let mut p = head;
     loop {
-        if (*p).state == TaskState::Blocked && (*p).block_deadline != 0 && now >= (*p).block_deadline
+        if (*p).state == TaskState::Blocked
+            && (*p).block_deadline != 0
+            && now >= (*p).block_deadline
         {
             (*p).state = TaskState::Ready;
             (*p).blocked_on = 0;

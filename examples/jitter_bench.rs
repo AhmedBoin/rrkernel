@@ -34,7 +34,14 @@ static DONE: AtomicBool = AtomicBool::new(false);
 
 /// Per-worker results: samples, worst/mean |error|, worst lap, ring length
 /// observed, and slices granted by the kernel (the fairness measure).
-static TABLE: [(AtomicU32, AtomicU32, AtomicU32, AtomicU32, AtomicU32, AtomicU32); WORKERS] = [const {
+static TABLE: [(
+    AtomicU32,
+    AtomicU32,
+    AtomicU32,
+    AtomicU32,
+    AtomicU32,
+    AtomicU32,
+); WORKERS] = [const {
     (
         AtomicU32::new(0),
         AtomicU32::new(0),
@@ -148,14 +155,17 @@ fn worker(id: usize) {
 
     let slot = &TABLE[id];
     slot.0.store(n as u32, Ordering::Relaxed);
-    slot.1.store(worst_err.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+    slot.1
+        .store(worst_err.min(u32::MAX as u64) as u32, Ordering::Relaxed);
     slot.2.store(
         (sum_err / n.max(1) as u128).min(u32::MAX as u128) as u32,
         Ordering::Relaxed,
     );
-    slot.3.store(worst_lap_ns.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+    slot.3
+        .store(worst_lap_ns.min(u32::MAX as u64) as u32, Ordering::Relaxed);
     slot.4.store(ring_seen, Ordering::Relaxed);
-    slot.5.store(scheduler::current_slices_run(), Ordering::Relaxed);
+    slot.5
+        .store(scheduler::current_slices_run(), Ordering::Relaxed);
 }
 
 /// Empirical clock granularity: how long until `Instant::now()` actually

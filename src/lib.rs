@@ -73,8 +73,8 @@
 )]
 #![allow(clippy::missing_safety_doc)]
 
-pub mod arena;
 pub mod app_support;
+pub mod arena;
 /// `#[rrkernel]` — the attribute macro that declares a program: `main` becomes task 0, the
 /// kernel gets configured by your call, and the fault/panic handlers come with it.
 ///

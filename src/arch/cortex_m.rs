@@ -45,7 +45,7 @@
 //! a stack switch is the classic source of silent corruption.
 
 use crate::config::{ConfigError, PlatformLimits, SchedulerConfig, Slice};
-use crate::tcb::{TaskControlBlock, TCB_FLAG_USE_MSP, TCB_SP_OFFSET, KERNEL};
+use crate::tcb::{TaskControlBlock, KERNEL, TCB_FLAG_USE_MSP, TCB_SP_OFFSET};
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 
@@ -462,7 +462,10 @@ pub fn start_timer(plan: crate::arch::TimerPlan) -> Result<(), ConfigError> {
         // Enable the cycle counter for latency measurement, if this core has
         // one (Cortex-M3+; M0/M0+ silently ignore the write).
         let ok = dwt_enable();
-        DWT_OK.store(if ok { 1 } else { 2 }, core::sync::atomic::Ordering::Relaxed);
+        DWT_OK.store(
+            if ok { 1 } else { 2 },
+            core::sync::atomic::Ordering::Relaxed,
+        );
 
         asm!("dsb", options(nomem, nostack, preserves_flags));
     }
@@ -535,10 +538,7 @@ pub fn adopt_current_task(tcb: *mut TaskControlBlock) -> Result<(), ConfigError>
 
 /// Build a fresh task: stack from the kernel arena plus an initial exception
 /// frame whose program counter is [`crate::trampoline::task_trampoline`].
-pub fn create_task(
-    tcb: *mut TaskControlBlock,
-    stack_size: usize,
-) -> Result<(), crate::SpawnError> {
+pub fn create_task(tcb: *mut TaskControlBlock, stack_size: usize) -> Result<(), crate::SpawnError> {
     // Worst-case alignment padding, so the 8-byte-aligned top is always inside
     // the block.
     let size = stack_size.max(256) + 8;

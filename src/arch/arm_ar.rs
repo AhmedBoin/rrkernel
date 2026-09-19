@@ -192,10 +192,12 @@ unsafe fn gic_enable_timer_irq(irq: u32) {
     // (delivered as IRQ). The same applies to SGI 0, which `request_switch` uses.
     let group_bits: u32 = if secure { 0 } else { bit | 1 };
     let g = read_volatile(gicd(GICD_IGROUPR0 + word * 4));
-    write_volatile(gicd(GICD_IGROUPR0 + word * 4), (g & !(bit | 1)) | group_bits);
+    write_volatile(
+        gicd(GICD_IGROUPR0 + word * 4),
+        (g & !(bit | 1)) | group_bits,
+    );
     write_volatile(gicd(GICD_IPRIORITYR + irq as usize) as *mut u8, 0xA0);
     write_volatile(gicd(GICD_ISENABLER0 + word * 4), bit | 1);
-
 
     // CPU interface: allow every priority, enable **both** interrupt groups.
     //
@@ -288,8 +290,6 @@ unsafe fn ticks_since_expiry() -> u32 {
     0u32.wrapping_sub(read_cntp_tval())
 }
 
-
-
 /// Restart the slice counter for whoever runs next: `TVAL = slice` counts down
 /// from a full slice and the `IMASK`/`ENABLE` bits are re-armed.
 ///
@@ -340,7 +340,10 @@ static TRACE_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicU
 
 /// Install a trace hook.
 pub fn set_trace_hook(hook: fn(usize, usize)) {
-    TRACE_HOOK.store(hook as *const () as usize, core::sync::atomic::Ordering::Relaxed);
+    TRACE_HOOK.store(
+        hook as *const () as usize,
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 #[inline]

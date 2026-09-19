@@ -49,8 +49,10 @@ pub const fn block_align_for<F>() -> usize {
 pub const fn block_size_for<F>() -> usize {
     // Worst case: header + enough padding to align the payload to `F`'s
     // alignment.
-    align_up(HEADER_SIZE + core::mem::align_of::<F>(), block_align_for::<F>())
-        + core::mem::size_of::<F>()
+    align_up(
+        HEADER_SIZE + core::mem::align_of::<F>(),
+        block_align_for::<F>(),
+    ) + core::mem::size_of::<F>()
 }
 
 /// Write `f` into the block at `base` and return `base` (the pointer handed to

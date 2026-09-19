@@ -164,7 +164,10 @@ fn report(worst_slice: Duration) {
         st.arena.allocations,
         st.arena.frees
     );
-    println!("switch service time: last {} ns, worst {} ns", st.last_latency, st.worst_latency);
+    println!(
+        "switch service time: last {} ns, worst {} ns",
+        st.last_latency, st.worst_latency
+    );
     print_ring();
     println!("----------------------------------------------------------\n");
 

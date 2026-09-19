@@ -315,13 +315,25 @@ fn task_three() {
         }
         let st = scheduler::stats();
         publish(|p| unsafe {
-            core::ptr::write_volatile(core::ptr::addr_of_mut!((*p).t3_slices), scheduler::current_slices_run());
-            core::ptr::write_volatile(core::ptr::addr_of_mut!((*p).total_threads), st.total_threads as u32);
-            core::ptr::write_volatile(core::ptr::addr_of_mut!((*p).active_threads), st.active_threads as u32);
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*p).t3_slices),
+                scheduler::current_slices_run(),
+            );
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*p).total_threads),
+                st.total_threads as u32,
+            );
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*p).active_threads),
+                st.active_threads as u32,
+            );
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*p).switches), st.switches as u32);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*p).ticks), st.ticks as u32);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*p).reclaimed), st.reclaimed as u32);
-            core::ptr::write_volatile(core::ptr::addr_of_mut!((*p).worst_switch_cycles), st.worst_latency);
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*p).worst_switch_cycles),
+                st.worst_latency,
+            );
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*p).slice_cycles), st.slice_cycles);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*p).core_hz), st.timer_hz);
         });

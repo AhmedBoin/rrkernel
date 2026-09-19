@@ -183,7 +183,11 @@ fn trap_log(ev: rrkernel::arch::TrapEvent) {
     }
 
     if n < 6 {
-        let phase = if ev.after_switch { "post-switch" } else { "trap       " };
+        let phase = if ev.after_switch {
+            "post-switch"
+        } else {
+            "trap       "
+        };
         rrkernel_demo::print(format_args!(
             "[{}] {} cause={:#x} mepc={:#010x} next={:p}\r\n",
             n, phase, ev.mcause, ev.mepc, ev.next

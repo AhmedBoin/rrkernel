@@ -146,7 +146,6 @@ pub const VEC_KERNEL: usize = VECBASE + 0x300;
 /// than pretending it can recover.
 pub const VEC_DOUBLE: usize = VECBASE + 0x3C0;
 
-
 // ---------------------------------------------------------------------------
 // Architectural constants
 // ---------------------------------------------------------------------------
@@ -415,7 +414,10 @@ static TRAP_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 
 /// Install a trap-observation hook (see [`TrapEvent`]).
 pub fn set_trap_hook(hook: fn(TrapEvent)) {
-    TRAP_HOOK.store(hook as *const () as usize, core::sync::atomic::Ordering::Relaxed);
+    TRAP_HOOK.store(
+        hook as *const () as usize,
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Remove the hook.
@@ -476,7 +478,11 @@ unsafe fn diag_hex(v: u32) {
     let mut shift = 28i32;
     loop {
         let nib = ((v >> shift) & 0xF) as u8;
-        diag_putc(if nib < 10 { b'0' + nib } else { b'a' + nib - 10 });
+        diag_putc(if nib < 10 {
+            b'0' + nib
+        } else {
+            b'a' + nib - 10
+        });
         if shift == 0 {
             break;
         }
@@ -647,22 +653,78 @@ macro_rules! trap_slot {
 // event — either way it must name itself instead of executing whatever bytes happen
 // to follow the table. Each slot gets its own park label because assembler labels in
 // these small stubs share a namespace.
-trap_slot!(xtensa_level2_vector, ".Level2Vector.text", 6, ".Lxt_park2:", "j       .Lxt_park2", "Level-2 interrupt vector (unused: reports and parks).");
-trap_slot!(xtensa_level3_vector, ".Level3Vector.text", 7, ".Lxt_park3:", "j       .Lxt_park3", "Level-3 interrupt vector (unused: reports and parks).");
-trap_slot!(xtensa_level4_vector, ".Level4Vector.text", 8, ".Lxt_park4:", "j       .Lxt_park4", "Level-4 interrupt vector (unused: reports and parks).");
-trap_slot!(xtensa_level5_vector, ".Level5Vector.text", 9, ".Lxt_park5:", "j       .Lxt_park5", "Level-5 interrupt vector (unused: reports and parks).");
-trap_slot!(xtensa_level6_vector, ".Level6Vector.text", 10, ".Lxt_park6:", "j       .Lxt_park6", "Level-6 (debug) interrupt vector: reports and parks.");
-trap_slot!(xtensa_level7_vector, ".Level7Vector.text", 11, ".Lxt_park7:", "j       .Lxt_park7", "Level-7 (NMI) interrupt vector: reports and parks.");
+trap_slot!(
+    xtensa_level2_vector,
+    ".Level2Vector.text",
+    6,
+    ".Lxt_park2:",
+    "j       .Lxt_park2",
+    "Level-2 interrupt vector (unused: reports and parks)."
+);
+trap_slot!(
+    xtensa_level3_vector,
+    ".Level3Vector.text",
+    7,
+    ".Lxt_park3:",
+    "j       .Lxt_park3",
+    "Level-3 interrupt vector (unused: reports and parks)."
+);
+trap_slot!(
+    xtensa_level4_vector,
+    ".Level4Vector.text",
+    8,
+    ".Lxt_park4:",
+    "j       .Lxt_park4",
+    "Level-4 interrupt vector (unused: reports and parks)."
+);
+trap_slot!(
+    xtensa_level5_vector,
+    ".Level5Vector.text",
+    9,
+    ".Lxt_park5:",
+    "j       .Lxt_park5",
+    "Level-5 interrupt vector (unused: reports and parks)."
+);
+trap_slot!(
+    xtensa_level6_vector,
+    ".Level6Vector.text",
+    10,
+    ".Lxt_park6:",
+    "j       .Lxt_park6",
+    "Level-6 (debug) interrupt vector: reports and parks."
+);
+trap_slot!(
+    xtensa_level7_vector,
+    ".Level7Vector.text",
+    11,
+    ".Lxt_park7:",
+    "j       .Lxt_park7",
+    "Level-7 (NMI) interrupt vector: reports and parks."
+);
 
 // The user exception vector: unused, because this kernel never leaves kernel mode
 // (`PS.UM` stays 0) — a trap here would mean user mode was entered by accident.
-trap_slot!(xtensa_user_exception_vector, ".UserExceptionVector.text", 13, ".Lxt_parku:", "j       .Lxt_parku", "User exception vector (unused: this kernel stays in kernel mode).");
+trap_slot!(
+    xtensa_user_exception_vector,
+    ".UserExceptionVector.text",
+    13,
+    ".Lxt_parku:",
+    "j       .Lxt_parku",
+    "User exception vector (unused: this kernel stays in kernel mode)."
+);
 
 // The double exception vector: a trap inside a trap (a window overflow while window
 // overflow is disabled, or a fault while handling a fault). There is no honest
 // recovery from here, so it reports — which is what turns "the kernel just hangs"
 // into actionable evidence.
-trap_slot!(xtensa_double_exception_vector, ".DoubleExceptionVector.text", 14, ".Lxt_parkd:", "j       .Lxt_parkd", "Double exception vector: reports and parks.");
+trap_slot!(
+    xtensa_double_exception_vector,
+    ".DoubleExceptionVector.text",
+    14,
+    ".Lxt_parkd:",
+    "j       .Lxt_parkd",
+    "Double exception vector: reports and parks."
+);
 
 /// The kernel exception vector. It owns a 0x40-byte slot, so it does no work itself:
 /// it parks the interrupted `a0` (the hardware saves no register here) and jumps to
@@ -968,18 +1030,18 @@ pub unsafe extern "C" fn _WindowUnderflow4() {
 #[link_section = ".WindowUnderflow4.text"]
 pub unsafe extern "C" fn xtensa_alloca_exception() {
     core::arch::naked_asm!(
-        "rsr     a0, WINDOWBASE",   // needs the old base before rotw changes it
-        "rotw    -1",               // old WINDOWBASE lands in a4, a0-a3 are scratch
+        "rsr     a0, WINDOWBASE", // needs the old base before rotw changes it
+        "rotw    -1",             // old WINDOWBASE lands in a4, a0-a3 are scratch
         "rsr     a2, PS",
-        "extui   a3, a2, 8, 4",     // PS.OWB
-        "xor     a3, a3, a4",       // bits that changed between old and current base
-        "rsr     a4, EXCSAVE1",     // the interrupted a0 waits there
-        "slli    a3, a3, 8",        // back into the OWB field
-        "xor     a2, a2, a3",       // flip exactly those bits in PS
+        "extui   a3, a2, 8, 4", // PS.OWB
+        "xor     a3, a3, a4",   // bits that changed between old and current base
+        "rsr     a4, EXCSAVE1", // the interrupted a0 waits there
+        "slli    a3, a3, 8",    // back into the OWB field
+        "xor     a2, a2, a3",   // flip exactly those bits in PS
         "wsr     a2, PS",
         "rsync",
         "bbci    a4, 31, _WindowUnderflow4",
-        "rotw    -1",               // the original a0 moved to a8
+        "rotw    -1", // the original a0 moved to a8
         "bbci    a8, 30, _WindowUnderflow8",
         "rotw    -1",
         "j       _WindowUnderflow12",
@@ -1004,7 +1066,7 @@ pub unsafe extern "C" fn xtensa_alloca_exception() {
 pub unsafe extern "C" fn _WindowOverflow8() {
     core::arch::naked_asm!(
         "s32e    a0, a9, -16",
-        "l32e    a0, a1, -12",      // a1 here is the incoming window's own sp
+        "l32e    a0, a1, -12", // a1 here is the incoming window's own sp
         "s32e    a1, a9, -12",
         "s32e    a2, a9,  -8",
         "s32e    a3, a9,  -4",
@@ -1376,7 +1438,10 @@ pub fn create_task(tcb: *mut TaskControlBlock, stack_size: usize) -> Result<(), 
             core::ptr::write_volatile(frame.add(off) as *mut usize, v);
         };
         // Where `rfi 1` starts executing, and with what machine state.
-        w(OFF_PC, crate::trampoline::task_trampoline as *const () as usize);
+        w(
+            OFF_PC,
+            crate::trampoline::task_trampoline as *const () as usize,
+        );
         w(OFF_PS, PS_TASK_ENTRY as usize);
         // The task starts with its frame as the *base* of its stack: its first
         // `entry` grows downward, below the frame, instead of over it.
@@ -1433,9 +1498,3 @@ pub fn on_task_reclaimed(_tcb: *mut TaskControlBlock) {}
 pub fn is_pinned(_tcb: *mut TaskControlBlock) -> bool {
     false
 }
-
-
-
-
-
-
