@@ -1,552 +1,506 @@
-# rrkernel a preemptive round-robin RTOS kernel in Rust
+<div align="center">
 
-One API for bare metal **and** desktop. Preemptive, cycle-exact slices, no priorities to
-tune, and an application that reads like a desktop program:
+# rrkernel
+
+**A preemptive round-robin RTOS kernel in Rust.**
+One API, from a Cortex-M0 to your desktop — timing you state in cycles, size measured in kilobytes.
+
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-dea584?logo=rust)](https://www.rust-lang.org)
+[![no_std](https://img.shields.io/badge/no__std-yes-2b2b2b)](#)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Deps](https://img.shields.io/badge/kernel%20core-zero%20deps-3fb950)](#)
+[![Tests](https://img.shields.io/badge/host%20tests-23%20passing-3fb950)](#testing--ci)
+[![Hardware](https://img.shields.io/badge/STM32F103-verified-3fb950)](#where-it-has-actually-been-run)
+
+</div>
+
+> **The short version.** Every task gets the same slice, chosen once at startup, and hardware
+> guarantees it is honoured — even when a task never yields. You write `thread::spawn(|| …)` with
+> closures, exactly like desktop Rust.
+
+<details>
+<summary><b>What it looks like, in 20 seconds</b></summary>
+
+```rust
+use rrkernel::{configure, thread, Duration, Slice};
+use rrkernel::rrkernel;
+
+#[rrkernel(log = rtt)]
+#[cortex_m_rt::entry]
+fn main() {
+    configure(8_000_000, Slice::Millis(1), 1024);   // clock, slice, stack — that is the contract
+
+    thread::spawn(|| loop {                          // CPU-bound, never yields:
+        core::hint::spin_loop();                     // preempted by hardware every millisecond
+    });
+
+    thread::spawn(|| loop {
+        led.set_low();
+        rrkernel::sleep(Duration::from_millis(500));  // no CPU burnt while waiting
+        led.set_high();
+        rrkernel::sleep(Duration::from_millis(500));
+    });
+}
+```
+
+No priorities. No `unsafe` in application code. No allocator. Two files: your `main.rs` and a
+`memory.x` your chip crate usually ships anyway.
+
+</details>
+
+---
+
+## Why another RTOS?
+
+**The problem.** On a microcontroller, *"it usually keeps up"* is not a specification. Control loops,
+sampling and protocol timing need a bounded **worst case**: a guaranteed slice, a guaranteed switch
+cost, and a guarantee that no single task can hold the CPU hostage.
+
+**The gap in the obvious choices.**
+
+| Option | What it gives you | Where precise timing suffers |
+|---|---|---|
+| **Superloop + `delay()`** | nothing to learn | one blocking call delays everything; each job's timing depends on the slowest other job |
+| **FreeRTOS / Zephyr (C)** | everything, configurable | priorities and priority inheritance turn the worst case into an *analysis problem* rather than a fact, and the scheduler is a black box from Rust |
+| **RTIC** | compile-time, zero-cost, superb for interrupt logic | it is an interrupt/resource framework, not a time-sliced scheduler: CPU-bound tasks are not preempted against each other |
+| **Embassy** | beautiful async I/O on one stack | cooperative: a future that does not yield stalls everything, and there is no preemption between independent workloads |
+| **`std::thread` (desktop)** | familiar, preemptive | needs an OS, an allocator and megabytes; the slices you get are the OS's guess |
+
+**How `rrkernel` answers it.**
+
+- **A slice you can state in cycles.** `Slice::Millis(1)` on an 8 MHz part is exactly 8000 `SysTick`
+  cycles — measured, not approximated, and validated at init rather than silently clamped.
+- **Preemption is the guarantee, not a feature.** A task that never yields is throttled by hardware:
+  every other task's worst case is `(N-1)` slices whether the offender cooperates or not.
+- **The switch is engineered and measured.** 38 cycles typical, 80 worst on an STM32F103 at 8 MHz,
+  because the timer counter restarts on every switch and error cannot accumulate.
+- **Rust all the way down, without giving up the desktop.** The same ring, counters and API run on
+  Windows and Linux, so timing-sensitive logic is developed and tested on a laptop and flashed
+  unchanged.
+- **Nothing in your way.** Task bodies are ordinary closures; `unsafe` stays in the kernel, the ports
+  and the macro.
+
+## What "precise" means here
+
+Measured on an STM32F103C8 at 8 MHz with 1 ms slices (`cargo run --release --bin fidelity` in
+`examples/cortex-m-bluepill` — reproducible on your board).
+
+| Metric | Measured | How |
+|---|---|---|
+| Slice length | **1 000 000 ns exactly** (8000 cycles) | `SysTick->LOAD`, chosen so the request is whole cycles |
+| Slice accuracy | **2 674 ns** worst error under full load | `DWT->CYCCNT` sampled in the tick handler |
+| Switch cost | **38 cycles typical / 80 worst** | `DWT` around the Rust half of `PendSV` |
+| Sleep precision | **601 sleeps: 0 early, 0 late** | every sleep checked against its own request |
+| Idle behaviour | **1 `wfi` per tick**, core parked between ticks | `idle_waits` counter + a verified sleep window |
+| Fairness | equal slices per task, no starvation | pure round robin by construction |
+
+---
+
+## How it works
+
+```mermaid
+flowchart LR
+    SYSTICK["SysTick<br/>8000 cycles = 1 ms"] -->|expires| PENDSV["PendSV<br/>the switch"]
+    PENDSV -->|"save R4-R11, restart the counter"| RING
+    subgraph RING["the ring — pure round robin, one priority level"]
+        direction LR
+        A(["Task A<br/>Running"]) --> B(["Task B<br/>Ready"]) --> C(["Task C<br/>Ready"]) --> A
+    end
+    PENDSV -.->|"wake at deadline"| W(["tick sweep<br/>wake_expired"])
+```
+
+### The slice is the whole contract
+
+The only scheduling knob is the slice, fixed before the first task runs:
+
+```rust
+configure(core_clock_hz, Slice::Millis(1), stack_bytes);
+```
+
+- The request becomes **whole timer cycles** and is reported back — `scheduler::slice_ns()` prints
+  what you actually got. A slice the hardware cannot honour is **rejected at init**, never clamped.
+- **Every switch restarts the counter**, so the successor always gets a complete slice: an early
+  exit, a spawn or a block cannot shorten anyone else's turn.
+- Sleeping is an **absolute deadline on the global tick**, not a per-task countdown, so a late
+  wake-up is corrected on the next period instead of accumulating.
+
+### What happens on a switch
+
+| Step | Where | Cost |
+|---|---|---|
+| `SysTick` expires | hardware | — |
+| `on_tick()`: count the tick, wake expired deadlines | Rust, in the ISR | a few dozen cycles |
+| `PendSV` is pended (lowest priority, so it never preempts another ISR) | `SysTick_Handler` | 1 store |
+| Save R4–R11, publish SP, walk the ring, restore the successor | asm + `schedule_next` | **38–80 cycles** |
+| Restart the slice counter (`SysTick->VAL = 0`) | asm | 1 store |
+
+### Guarantees
+
+| Guarantee | Bound | Why it holds |
+|---|---|---|
+| A **runnable** task runs within | `(N-1) × (slice + switch)` | one lap of a pure round-robin ring |
+| A task blocked on a lock or I/O runs within | its deadline, plus that same bound after the wake | keyed blocking; waking is O(1) |
+| Worst-case switch time | `(N-1)` ring steps + the measured switch | sleepers stay in the ring, so the walk grows with N |
+| No task can starve a peer by not yielding | hardware-enforced | the tick is a hardware interrupt |
+| Switching is allocation-free and O(1) | always | O(1) unlink, bump arena, deferred free |
+
+> The `(N-1)` bound covers tasks that are **runnable**. A task waiting on a lock is bounded by the
+> holder's progress instead: the static lock-order rule keeps that chain finite, but it is not
+> `(N-1)` slices, and the documentation says so rather than pretending otherwise.
+
+### Sleeping, blocking, yielding — one mechanism
+
+Everything funnels through a single blocking primitive: the deadline is read, the state becomes
+`Blocked`, and the switch is pended **inside one critical section**, so a tick can never observe a
+half-formed waiter.
+
+| You write | What happens | Cost while waiting |
+|---|---|---|
+| `rrkernel::sleep(d)` | parks until an absolute tick | 0 CPU |
+| `signal.wait(deadline)` | parks until an ISR `set`s it | 0 CPU, woken in O(1) |
+| `scheduler::yield_now()` | gives up the slice, stays `Ready` | 1 switch |
+| `fut.await` under `exec::block_on` | parks on `Pending`, re-polled on wake | 0 CPU |
+| `embedded_io::Read` on a `Pipe` | parks the reader, the ISR wakes it | 0 CPU — **measured: 0 slices** |
+| `wait_until(ready, deadline)` | yields once per poll (no interrupt to wait on) | 1 switch per poll, never starves |
+
+An `nb::WouldBlock`, a `Pending` future, a `Signal` that has not fired, and a task with nothing to do
+are all "give the slice back now": the round robin continues instead of spinning.
+
+### How it shapes your application
+
+| Instead of | You write |
+|---|---|
+| priorities to stop one job hogging the CPU | nothing — the slice does it |
+| `while flag {}` polling or a hand-tuned delay | `signal.wait(timeout)` / `fut.await` |
+| a state machine split across `switch` cases just so it can yield | an ordinary function, or an `async fn` that awaits |
+| `static mut` with `unsafe` accessors | closures that capture their own state (`Send + 'static`) |
+| a hand-written "idle task" | none — the kernel parks the core when nothing is runnable |
+| two copies of a driver for blocking and async callers | one async driver + `hal::Blocking` |
+
+## Key features
+
+- **Preemptive round robin, one priority level.** No priorities, no priority inheritance, no work
+  stealing, no preempt-on-wake: a woken task waits its turn.
+- **Cycle-exact slices** chosen at init, validated against the hardware, restarted on every switch.
+- **`#[rrkernel]`** installs the entry point, the configuration, the vector wiring, the panic and
+  fault handlers, an optional RTT log sink and task 0 — your `main` stays short.
+- **Familiar API.** `thread::spawn` takes `FnOnce() + Send + 'static`, exactly like `std::thread`;
+  `sleep(Duration)`, `now()`, `deadline_after`, `spawn_async`.
+- **Events and waiting:** `Signal` (ISR-safe and race-free), `WaitQueue` (single-wakeup hand-off),
+  `park`/`wake`/`TaskId`, `yield_now`, and a poll-yield fallback with a mandatory deadline.
+- **Async without an executor dependency:** `exec::block_on`, a task `Waker`, `Sleep`, `spawn_async`
+  — `core::future` only, no allocator, futures live on their task's own stack.
+- **The standard embedded traits, always available** (no feature flags to discover):
+  `embedded-hal` + `embedded-hal-async` for delays, a blocking facade over an async driver and a
+  kernel-mutex shared-bus device; `embedded-io` + `embedded-io-async` for the ISR-driven `Pipe`.
+- **`core`-only kernel.** No `alloc`, no libc; TCBs, closure blobs and stacks come from a bump arena
+  with deferred reclamation.
+- **Six ports, one API:** Cortex-M0/M0+/M3/M4/M33, RISC-V 32, ARM A/R, Xtensa, plus Windows and Linux
+  backends so you can develop and test on a laptop.
+- **Measured, not claimed.** Every number in this README comes from a counter in the kernel
+  (`scheduler::stats()`), reproducible on real hardware.
+
+---
+
+## Where it has actually been run
+
+| Target | Real hardware | QEMU | Host tests | Builds |
+|---|---|---|---|---|
+| **Cortex-M3** — STM32F103C8 ("Blue Pill") | ✅ **`VERDICT : PASS`** — 601 sleeps, 0 early, 1 `wfi`/tick, switch 38/80 cycles | runs, no faults | — | ✅ |
+| **Cortex-M4** — STM32F401 ("Black Pill") | LED + threads run; RTT blocked by a probe-rs flashing quirk | — | — | ✅ |
+| **Cortex-M0 / M0+** (`thumbv6m`) | not yet on a board | — | — | ✅ |
+| **Cortex-M33** (`thumbv8m.main`) | no | — | — | ✅ |
+| **RISC-V 32** (`riscv32imac`) | no | ✅ `VERDICT : PASS`, exits 0 | — | ✅ |
+| **ARM A/R** (`armv7a`, `armv7r`) | no | ✅ `VERDICT : PASS` (guest never exits) | — | ✅ |
+| **Xtensa LX6** (ESP32) | no | boots, switch runs, **resume wrong → no verdict** (`docs/ESP32.md`) | — | nightly only |
+| **Windows** (`win32`) | n/a | — | ✅ 23 tests | ✅ |
+| **Linux** (`posix`) | n/a | — | ✅ 23 tests (WSL) | ✅ |
+| **macOS** | no | — | — | `compile_error!` — work list in `docs/PORTING.md` |
+
+## Testing & CI
+
+```bash
+cargo test --features std                                     # 23 tests: ring, arena, closure, ABI, events
+cargo clippy --all-targets --features std -- -D warnings       # clean on host + all six bare-metal targets
+cargo fmt --all --check
+cargo run --example sleep_fidelity --features std              # sleep fidelity + idle window
+cargo run --example io_layers --features std                   # I/O layers acceptance
+cargo run -p firmware-riscv  --target riscv32imac-unknown-none-elf --release   # QEMU verdict
+cargo run -p firmware-arm-a  --target armv7a-none-eabi             --release   # QEMU verdict
+cd examples/cortex-m-bluepill && cargo run --release --bin fidelity            # on your board
+```
+
+CI runs four jobs: `posix-core` (fmt, clippy, tests, examples), `windows`, `bare-metal` (build **dev
+and release** for six targets + clippy), and `qemu` (verdicts for RISC-V 32 and ARM A/R). The dev
+build matters: `lto = "fat"` defers codegen, and a release-only build once hid a real compile error.
+
+## Honest limits
+
+<details>
+<summary><b>What is known to be incomplete or unproven</b> — click to expand</summary>
+
+- **Host tick source in some task sets.** On Windows *and* Linux, `tick_count()` has been observed to
+  stay `0` from init in the `io_layers` scenario, which stalls deadline-based paths (timeouts, async
+  timers). The blocking-I/O paths are unaffected, and the metal port ticks normally (3254 ticks
+  measured). `examples/io_layers.rs` exits 3 with that diagnosis instead of hanging.
+- **Asymmetric parking on the host backends.** On every bare-metal port a blocking call has taken the
+  caller off the CPU before it returns. On Win32 the tick thread parks the task a moment later; on
+  POSIX the `SIGALRM` handler has no idle context to switch to when nothing is runnable. Each port
+  reports this through `arch::parks_synchronously()`, and `sleep_fidelity` gates its strict form on it.
+- **The `layers` firmware flashes but prints nothing** (park/async/pipe demo). `fidelity` on the same
+  probe prints and passes, so it is the new binary or the async path, not the toolchain. Under
+  investigation.
+- **`sync::Mutex` and multi-core are not hardware-verified.** The lock layer compiles everywhere with
+  32-bit atomics and its lost-wakeup path is fixed and reasoned about; the shared-bus device built on
+  it has not been exercised on a real bus. Multi-core validates and refuses `active_cores > 1` rather
+  than pretending: no port starts a secondary core, and `-smp 2` has never been run.
+- **The Xtensa port does not pass** (`docs/ESP32.md`), and macOS is a `compile_error!` until its
+  `sigaction`/`sigevent` layouts are adapted.
+- **The crate has dependencies.** The *kernel core* is `core`-only with no allocator, but the crate
+  always pulls `embedded-hal`, `embedded-hal-async`, `embedded-io` and `embedded-io-async` (all
+  `no_std`). That is the deliberate cost of making the standard traits available without feature flags.
+- **1-hour soak tests and physically unplugged peripherals** are not automated anywhere yet.
+
+</details>
+
+---
+
+## Quickstart
+
+<details open>
+<summary><b>On a board</b> (STM32F103 "Blue Pill")</summary>
+
+`Cargo.toml`
+
+```toml
+[dependencies]
+rrkernel = "0.3"
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+rtt-target = "0.6"          # only if you want `log = rtt`
+```
+
+`.cargo/config.toml`
+
+```toml
+[target.thumbv7m-none-eabi]
+runner = "probe-rs run --chip STM32F103C8"
+rustflags = ["-C", "link-arg=-Tlink.x"]
+[build]
+target = "thumbv7m-none-eabi"
+```
+
+`src/main.rs`
 
 ```rust
 #![no_std]
 #![no_main]
 
-use rrkernel::{configure, thread, Slice};
+use rrkernel::{configure, thread, Duration, Slice};
+use rrkernel::rrkernel;
+use rtt_target::rprintln;
 
-#[rrkernel(log = rtt)]          // entry point, fault + panic handlers, console: all emitted
+#[rrkernel(log = rtt)]              // entry point, vectors, panic + fault handlers, task 0
 #[cortex_m_rt::entry]
 fn main() {
-    configure(8_000_000, Slice::Millis(1), 1024);   // core clock, slice, per-task stack
+    configure(8_000_000, Slice::Millis(1), 1024);
 
-    thread::spawn(blink);                            // a thread
-    thread::spawn(report);                           // another
+    thread::spawn(|| loop { core::hint::spin_loop() });      // never yields: still throttled
+    thread::spawn(|| loop {
+        rprintln!("tick at {} ms", rrkernel::now());
+        rrkernel::sleep(Duration::from_millis(500));
+    });
 
-    // main IS task 0: it spawns, sleeps and returns like any other thread.
-    loop {
-        rrkernel::sleep_secs(1);
+    // Returning from `main` is a task exit: task 0 is unlinked like any other.
+}
+```
+
+Then `cargo run --release` flashes and streams RTT. Complete, working copies live in
+[`examples/cortex-m-bluepill`](examples/cortex-m-bluepill) (F103) and
+[`examples/cortex-m-blackpill`](examples/cortex-m-blackpill) (F401).
+
+</details>
+
+<details>
+<summary><b>On a desktop</b> — same API, no hardware</summary>
+
+```bash
+cargo run --example roundrobin_demo --features std      # preemption, auto-unlink, report
+cargo run --example sleep_fidelity  --features std      # sleep precision + idle windows
+cargo run --example io_layers       --features std      # shared bus, ISR-driven pipe, async
+```
+
+The ring, counters and API are identical; only the backend differs (a waitable timer plus thread
+suspend/resume on Windows, `SIGALRM` plus fibre switching on Linux). Timing limits are the host's,
+and the examples report exactly what they measured — on one Windows machine a 1 ms slice is at the
+edge of what the OS timer can honour, and the example says so.
+
+</details>
+
+### Waiting on hardware without burning the slice
+
+```rust
+use rrkernel::event::Signal;
+use rrkernel::io::Pipe;
+
+static RX: Pipe = Pipe::new();
+
+#[cortex_m_rt::interrupt]
+fn USART1() {
+    while let Some(b) = read_hw_byte() {
+        RX.push_from_isr(b);            // ISR-safe, allocation-free, wakes the reader
     }
 }
+
+thread::spawn(|| {
+    let mut buf = [0u8; 64];
+    loop {
+        let deadline = rrkernel::deadline_after(Duration::from_millis(100));
+        match RX.read_blocking(&mut buf, Some(deadline)) {
+            Ok(n) => handle(&buf[..n]),
+            Err(_) => {}                // Err(Timeout): the device went quiet
+        }
+    }
+});
 ```
 
-`configure` takes the three numbers the kernel cannot know; `#[rrkernel]` supplies
-everything else the entry point, the vector-table wiring, a `HardFault` and
-`DefaultHandler` that *report* before parking, and a `#[panic_handler]`, so an application
-never depends on `panic-halt` and a fault never looks like a hang.
+The reader is `Blocked` between bytes: **measured 0 slices consumed** while 71 bytes arrived.
 
-* **Bare metal** (`no_std`): Cortex-M0/M0+/M3/M4/M7/M33 (verified on hardware see below),
-  RISC-V 32, ARM A/R, and a port for Xtensa in progress. `SysTick` as the slice timer,
-  `PendSV` for the context switch, hand-written Thumb assembly, and a **cycle-exact** slice
-  you choose at init.
-* **Desktop** (`std`, Windows/Linux): the same ring, counters and life cycle on top of OS
-  primitives suspend/resume of real threads on Windows, `SIGALRM` plus hand-written x86-64
-  fiber switching on Linux.
-* **Sleeping with units**: `sleep(Duration::from_millis(250))`, `sleep_secs`, `sleep_minutes`,
-  `sleep_hours`, plus absolute deadlines (`deadline_after`/`sleep_until`) for periodic work
-  that cannot drift. A sleeping task is switched away, never spun on.
-* **The kernel itself depends on nothing** `core` only, on every target. `#[rrkernel]`
-  costs `syn`/`quote` *in the compiler* (host-only), and `default-features = false` removes
-  even that.
+### Async, when a state machine is easier to write
 
 ```rust
-use rrkernel::{scheduler, thread, SchedulerConfig, Slice};
-
-fn main() {
-    // 1. Choose the slice *first*: this is the timing contract.
-    scheduler::init_with(SchedulerConfig::embedded(Slice::Millis(1), 168_000_000)).unwrap();
-
-    // 2. Spawn a CPU-bound task. It never yields it is preempted every slice.
-    thread::spawn(|| loop {
-        core::hint::spin_loop();
-    });
-
-    // 3. Spawn a task that finishes. Returning IS the exit: the trampoline
-    //    unlinks it, updates the counters, and switches away immediately.
-    thread::spawn(do_work);
-
-    // Task 0's body: returning here also unlinks task 0, so the call never
-    // falls back into the C runtime / reset handler.
-    scheduler::main_body(|| {
-        // Tasks may spawn tasks at any time:
-        thread::spawn(|| { /* child, inserted into the live ring */ });
-    });
-}
-
-fn do_work() {}
+thread::spawn(|| rrkernel::exec::block_on(async {
+    loop {
+        rrkernel::exec::sleep(Duration::from_millis(100)).await;   // gives the slice back
+        sample_and_filter().await;
+    }
+}));
 ```
 
-## Why another RTOS
+A `.await` that returns `Pending` hands the CPU over immediately — same guarantee as a blocking
+`sleep`, so an async task cannot starve anyone either.
 
-This kernel exists for one property above all others: **timing you can reason about**. The
-slice is not "about a millisecond" it is a number of core cycles you choose at init, and
-the switch is engineered so that number stays true.
+### One bus, many tasks
+
+```rust
+use rrkernel::hal::MutexDevice;
+
+// Acquired with a timeout, held across a whole transaction, released on drop. The loser is parked,
+// not spun — and never `CriticalSectionDevice`, which would mask interrupts for the transfer.
+static I2C: MutexDevice<MyI2c, 0x4000_0001> = MutexDevice::with_timeout(my_bus, 100);
+```
+
+An async driver can also be offered to blocking code without a second implementation:
+`rrkernel::hal::Blocking::new(async_driver)`.
+
+---
+
+## The API in one screen
+
+| Area | Items |
+|---|---|
+| **Start** | `configure(clock, slice, stack)`, `#[rrkernel(log = rtt)]`, `scheduler::init_with(cfg)` |
+| **Tasks** | `thread::spawn`, `spawn_with_stack`, `try_spawn`, `scheduler::main_body`, `SchedulerConfig` |
+| **Time** | `now()`, `sleep(Duration)`, `sleep_ms/us/secs/minutes/hours`, `deadline_after`, `deadline_add`, `sleep_until`, `ticks_for`, `tick_ns()` |
+| **Events** | `Signal` (ISR-safe `set`/`wait`), `WaitQueue` (`wake_one`/`wake_all`), `park`/`wake`/`TaskId`, `yield_now`, `wait_until` |
+| **Async** | `exec::block_on`, `exec::sleep`, `exec::spawn_async`, `exec::current_waker`, `SignalWait` |
+| **Locks** | `sync::Mutex` (sleeping, static lock order, `try_lock_for`), `hal::MutexDevice` (shared bus) |
+| **HAL/IO** | `hal::KernelDelay`, `hal::Blocking`, `io::Pipe` (`Read`/`Write`, blocking **and** async) |
+| **Inspection** | `scheduler::stats()` (ticks, switches, worst period error, worst switch, arena, `blocks_without_current`), `for_each_task`, `platform_limits()`, `arch::idle_waits()` |
+
+## Repository layout
 
 ```text
-STM32F103 @ 8 MHz, 1 ms slice   measured on hardware
-  slice      : 8000 ticks, exactly 1 000 000 ns            (SysTick->LOAD + 1)
-  period err : worst 9718 ns                               (the tick lands within ~10 µs)
-  switch     : worst 108 cycles  (≈ 13.5 µs at 8 MHz)      (PendSV entry + frame + ring walk)
-  3 periodic threads while a CPU-bound task never yields:
-     [A] every 100 ms → late by 0 ms, 32 times out of 32
-     [B] every 250 ms → late by 0 ms
-     [C] every 500 ms → late by 0 ms
-```
-
-### Cooperative vs preemptive and why it matters for critical timing
-
-| | **Cooperative** | **Preemptive** (this kernel) |
-|---|---|---|
-| When a switch happens | only when the task yields, sleeps, or blocks | at a hardware timer boundary, set once at init |
-| A task that spins forever | stalls the whole system | loses the CPU at the slice boundary, automatically |
-| Worst-case latency to a runnable task | the longest yield-free region in *any* task | one slice, plus one switch (~13 µs at 8 MHz) |
-| Slice accuracy | whatever the code between yields happens to do | `SysTick` reload + restart on every switch, so the period cannot drift |
-| Priorities | usually needed to fix the "one task starves the rest" problem | none needed every task has the same priority, the only knob is the slice |
-| Writing a task | must remember to yield, everywhere | a plain function; `loop { spin }` is legal and cannot monopolise |
-
-Cooperative schedulers can look *more* precise nothing interrupts anything, so the latency
-of a hand-off is tiny right up to the moment one task forgets to yield, which turns
-"precise" into "unbounded". This kernel takes the opposite trade: **worst case instead of best
-case**. A misbehaving task is throttled by hardware, and the numbers above hold *while* a
-CPU-bound task spins in a tight loop, which is the situation that matters in a control loop.
-
-The precision comes from three implementation choices, and they are the reason the numbers are
-what they are rather than "whatever the OS felt like today":
-
-1. **The slice is cycles, not milliseconds.** `plan_timer` converts your request into a
-   `SysTick` reload and reports back the *achieved* value, refusing configurations the
-   hardware cannot honour instead of clamping silently.
-2. **Every switch restarts the counter** (`SysTick->VAL = 0`), so the successor gets a whole
-   slice and error cannot accumulate over thousands of ticks.
-3. **Sleeping is a deadline on the global tick**, not a per-task countdown. A task that asks
-   for 100 ms wakes at the next tick at or after its absolute deadline, so a late wake-up is
-   corrected on the next period instead of being added to it. Under a busy system the
-   periods stay exact that is what "0 ms lateness" above means.
-
-### The same API as `std::thread`, without the OS
-
-It is meant to read like desktop code, because that is the part Rust programmers already know:
-
-```rust
-thread::spawn(|| loop {                       // a closure, moved onto its own stack
-    led.set_low();
-    rrkernel::sleep_secs(1);                  // blocking sleep, deadlines on a global tick
-    led.set_high();
-    rrkernel::sleep_secs(1);
-});                                           // returning is the exit: nothing to join
-```
-
-`thread::spawn` takes `FnOnce() + Send + 'static` exactly like the standard library's, task
-bodies are ordinary closures, and **application code contains no `unsafe`**. What differs is
-what is *behind* it: no OS, no `alloc`, no `libc`, no global allocator, `core`-only, and a
-task costs a stack carved from a bump arena on an STM32F103 the whole demo firmware
-(kernel + three tasks + report) fits in **5904 bytes of flash and 96 bytes of `.data`**.
-
-## Project status: what is done, what is in progress, what is missing
-
-| Area | Status | Evidence |
-|---|---|---|
-| Preemptive round robin, slice planning, arena, ring, deferred reclamation | **complete** | `cargo test --features std` → 8 + 2 pass |
-| Cortex-M backend (`SysTick` + `PendSV`, cycle-exact) | **complete, verified on hardware** | STM32F103C8: worst switch 108 cycles, worst period error 9718 ns, 0 ms lateness on 100/250/500 ms periods while a spinner never yields |
-| `#[rrkernel]`, `configure`, units-based sleep | **complete, verified on hardware** | both board examples build and run; `sleep(2500 ms)` woke at exactly 2500 ticks; task 0 exits while other threads keep running |
-| Cortex-M0/M0+ (`thumbv6m`) | **complete, builds** | `firmware-cortex-m` links for `thumbv6m`; no M0 board has been attached yet |
-| RISC-V 32 backend (CLINT, trap frame, `mret`) | **complete, verified in QEMU** | `-M virt` → `VERDICT : PASS`, QEMU exits 0 |
-| ARM A/R backend (generic timer, GICv2, banked `SP`) | **complete, verified in QEMU** | `-M virt -cpu cortex-a15` → `VERDICT : PASS`; also compiles for `armv7r` |
-| Windows backend (high-resolution waitable timer, suspend/resume) | **complete; precision limited by the OS** | tests pass; the demo's rotation assertion **fails on a 1 ms slice on the machine this README was written on** (worst tick error 993 400 ns, timer granularity 0.5 ms). Use 5–10 ms slices there |
-| Linux backend (`timer_create`/`SIGALRM` + x86-64 fibre switch) | **complete; scripted, not measured by the author** | `bash scripts/run-linux.sh` runs tests + smoke + demo + bench |
-| macOS / BSD | **not started** | work list in `docs/PORTING.md`: three struct layouts and the timer semantics |
-| `sync::Mutex` (lock ordering, timeout, back-off) | **complete; never exercised at runtime** | compiles on every target with 32-bit atomics; no test runs it |
-| Multi-core: `CpuArch`, spinlocks, `active_cores` | **machinery complete; bring-up missing** | validates and *refuses* `> 1` where there is no cross-core interlock; no port starts a secondary core, `-smp 2` has never been run |
-| Xtensa / ESP32 LX6 | **in progress** | builds, boots in Espressif QEMU, prints over UART0, the switch runs end to end then the *resume* is wrong, so no verdict. `docs/ESP32.md` |
-| ESP32-C3/C6, AArch64, RV64 | **not started** | needs a different tick source (Timer Group/SysTimer) or 64-bit frames |
-| AVR (ATmega328P) | **not started, but the core is compatible** | needs `-C target-cpu=atmega328p` + `avr-gcc` to link |
-
-### Where it has actually been run
-
-| Target | Real hardware | QEMU | In the build matrix |
-|---|---|---|---|
-| Cortex-M3 (`thumbv7m`) STM32F103C8 "Blue Pill" | **yes, `VERDICT : PASS`** | runs; no faults, 1579 IRQs in 3 s (the QEMU firmware's report lives in flash, so QEMU cannot print a verdict) | yes |
-| Cortex-M4 (`thumbv7em`) STM32F401 "Black Pill" | **LED + all threads run**; RTT blocked by a `probe-rs` flashing quirk (its first flash word lands as zero, so the core faults before executing) `probe-rs read b32 0x08000000 2` must read `20010000 08000195` | | yes |
-| Cortex-M0 (`thumbv6m`), Cortex-M33 (`thumbv8m.main`) | no | | builds / `cargo check` |
-| RISC-V 32 (RV32IMAC) | no | **yes, `VERDICT : PASS`** | yes |
-| ARM A/R (ARMv7-A/`armv7r`) | no | **yes, `VERDICT : PASS`** | yes |
-| Xtensa LX6 (ESP32) | no | boots, no verdict yet (Espressif QEMU) | build only (needs the esp-rs fork) |
-| Windows x86-64 | **yes** (tests pass; demo assertion fails at a 1 ms slice see above) | | tests |
-| Linux x86-64 | not by the author | | `scripts/run-linux.sh` |
-| macOS | no | | |
-
-Nothing in that table is an estimate: every "verified" line is reproducible with a command in
-this file, and the entries that say *not* verified say so because they have not been.
-
-
-
-
-| Not needed | Because |
-|---|---|
-| `scheduler_run()` | `scheduler::init*()` arms the tick source immediately; tasks are scheduled as they are spawned |
-| `task::yield_now()` | the timer preempts every task at the slice boundary |
-| explicit exit / loop handling | the trampoline unlinks the task, decrements the counters and triggers an immediate switch |
-| priorities / priority inheritance | pure round robin, identical priority for every task the only knob is the slice |
-| `libc`, `alloc`, a global allocator, any crate | the kernel is `core`-only: FFI is declared by hand, task bodies are placed with `ptr::write`/`ptr::read`, stacks come from a bump arena |
-
-## Commands
-
-```bash
-# Host: tests, then the demos (Windows and Linux)
-cargo test --features std
-cargo run --example roundrobin_demo --features std --release
-cargo run --example jitter_bench    --features std --release
-cargo run --example smoke           --features std            # backend sanity check
-
-# Linux/POSIX backend end-to-end (tests + smoke + demo + bench)
-bash scripts/run-linux.sh
-
-# Bare metal: builds and links with the bundled rust-lld, no extra toolchain
-cargo build -p firmware-cortex-m --target thumbv7m-none-eabi --release
-cargo build -p firmware-cortex-m --target thumbv6m-none-eabi --release   # Cortex-M0
-cargo check --target thumbv8m.main-none-eabihf                          # Cortex-M33/M35P
-
-# A board, end to end: configure, flash, watch RTT over the probe
-rustup target add thumbv7m-none-eabi
-cd examples/cortex-m-bluepill && cargo run          # STM32F103C8, RTT + LED-free
-cd examples/cortex-m-blackpill && cargo run         # STM32F401, stm32f4xx-hal LED thread
-
-# What the requested Cortex-R target compiles to (same source as Cortex-A)
-cargo build -p firmware-arm-a --target armv7r-none-eabi --release
-
-# QEMU: RISC-V 32 and ARM A/R profile, end-to-end.
-# QEMU exits with the demo's verdict as its status (0 = all checks passed).
-cargo run -p firmware-riscv  --target riscv32imac-unknown-none-elf --release
-cargo run -p firmware-arm-a  --target armv7a-none-eabi             --release
-```
-
-### Building and running the ESP32 port
-
-```powershell
-# one-time toolchain: esp-rs fork (rustup run esp) + Espressif GCC for linking
-espup install -t esp32
-
-# Espressif's QEMU is the only one with an ESP32 machine; upstream QEMU 11 has
-# neither the machine nor the CPU. Fetch the win64 archive from
-# https://github.com/espressif/qemu/releases and extract it to tools/qemu-esp32.
-rustup run esp cargo build -p firmware-esp32 -Zbuild-std=core --release `
-    --target xtensa-esp32-none-elf
-
-tools\qemu-esp32\qemu\bin\qemu-system-xtensa.exe -nographic -machine esp32 `
-    -global driver=timer.esp32.timg,property=wdt_disable,value=true `
-    -kernel target\xtensa-esp32-none-elf\release\firmware-esp32
-```
-
-`-global … wdt_disable` is not optional (the emulated watchdog resets the guest
-mid-demo), and the port's status is **bring-up complete, scheduling not yet
-verified** read [`docs/ESP32.md`](docs/ESP32.md) before trusting anything it prints.
-
-### The regression matrix
-
-Everything below is what "green" means in this repository, and it is the list to run
-after touching the kernel core or a port:
-
-| Command | Expected |
-|---|---|
-| `cargo test --features std` | 8 + 2 tests pass (ring/arena/closure/ABI invariants) |
-| `cargo build --target {thumbv6m,thumbv7m,thumbv8m.main,armv7a,armv7r,riscv32imac}-…` | all clean, no warnings |
-| `cargo run -p firmware-riscv --target riscv32imac-unknown-none-elf --release` | `VERDICT : PASS`, QEMU exits 0 |
-| `cargo run -p firmware-arm-a --target armv7a-none-eabi --release` | `VERDICT : PASS` |
-| `rustup run esp cargo build -p firmware-esp32 -Zbuild-std=core --release --target xtensa-esp32-none-elf` | links (execution: see `docs/ESP32.md`) |
-
-## Multi-core and synchronization (current state)
-
-The design is architecture-agnostic; the multi-core *bring-up* is not finished. Read
-this section as the honest contract, because the two halves have very different
-guarantees today.
-
-**What exists and is exercised by tests:**
-
-* **`src/smp.rs`** the `CpuArch` HAL, and the only per-core facts in the kernel:
-  `current_core_id()`, `max_cores()`, `supports_smp()`, `spinlock_acquire/release`,
-  and `send_ipi(target_core)`. Implemented for **RISC-V** (`mhartid`, `lr.w`/`sc.w`,
-  CLINT `msip`), **ARM A/R** (`MPIDR`, `LDREX`/`STREX`, GICv2 `SGIR`), **Xtensa**
-  (`PRID`, `S32C1I`, `DPORT`), the **host** (OS thread id, `Atomic*`, no-op) and a
-  **single-core fallback**.
-* **`smp::SpinLock`** cross-core mutual exclusion *and* local interrupt masking,
-  both required: the interlock alone lets a core be interrupted while holding a lock
-  and then spin forever waiting for itself. The lock word is per-target because a
-  byte-wide `AtomicBool` only exists where the hardware has byte atomics.
-* **`KernelConfig { active_cores }`** plus `scheduler::set_active_cores(n)`, which
-  validates `1..=smp::max_cores()` and **refuses `> 1` on a target without a
-  cross-core interlock** rather than pretending.
-* **`src/sync.rs`** a sleeping `Mutex<T>` with a monotonic `LockId`, an owner task
-  id, `lock`, `try_lock`, `try_lock_for(timeout_ms)`, `unlock`, and
-  `lock_with_backoff(timeout, attempts, attempt)` for the runtime recovery path.
-  Contention marks the caller `Blocked(lock id)` and asks for an **O(1) context
-  switch** instead of spinning; `unlock` wakes exactly those waiters.
-* **Static deadlock prevention**: each task records the locks it holds, and an
-  acquisition whose `LockId` is not strictly greater than the last held one is
-  refused with `LockError::OrderViolation`. Ids are creation-ordered, so "acquire in
-  increasing id order" is a total order a circular wait cannot exist in a total
-  order.
-* **`TaskState::Blocked`** a blocked task stays *linked* in the ring (so its
-  rotation slot and the O(1) wake path survive) and `ring::next_runnable` simply skips
-  it. The tick sweeps expired deadlines, which is what makes `try_lock_for` time out.
-
-**What is not done yet:**
-
-* **No port starts a secondary core.** `active_cores > 1` is configurable and
-  validated, but `arch::start_secondary_cores()` does not exist and the kernel still
-  keeps *one* global `current_tcb`. Making `active_cores > 1` real needs per-core
-  `current` state (kept after offset 0, so the Cortex-M `PendSV` literal offset
-  survives), the global interlock taken by `critical_enter` when more than one core
-  runs, and IPI-driven rescheduling.
-* **`qemu-system-riscv32 -smp 2` / `qemu-system-arm -smp 2` have not been run.** No
-  SMP demo exists, so there is **no multi-core scheduling or contention evidence** in
-  this repository only the machinery above.
-* **The `sync` layer is host-tested only.** It compiles for every target that has a
-  32-bit atomic RMW, but it has never run on a board.
-* `sync` is compiled **out** on targets with no atomic RMW (`thumbv6m`/Cortex-M0, AVR,
-  `riscv32imc`) a mutex whose owner field cannot be updated atomically is not a
-  mutex. `smp::supports_smp()` is `false` there too, so `set_active_cores(2)` returns
-  a `ConfigError` instead of misbehaving later.
-
-
-## Architecture support
-
-The *same* kernel, the *same* `TaskControlBlock`, and the *same* application code
-(`firmware-common/`, shared by every board below) run on all of these. A port
-replaces only the stack-frame layout, the timer, and the switch assembly; it is
-selected by the target triple, so there are no feature flags to get wrong.
-
-| Architecture | Target | Status | Timer / switch |
-|---|---|---|---|
-| ARM Cortex-M0/M0+/M3/M4/M7/M33 | `thumbv6m`, `thumbv7m`, `thumbv8m.main`, `thumbv7em` | **verified on hardware** (STM32F103C8 "Blue Pill", `thumbv7m`): `VERDICT : PASS`, 100 ms/250 ms/500 ms threads landing on **0 ms lateness** with a CPU-bound spinner running, `sleep_secs` waking exactly, and task 0 exiting cleanly. Builds for `thumbv6m` and links the RISC-V/ARM/QEMU targets below. | `SysTick` slice, `PendSV` register-save, hardware stack frame |
-| **RISC-V 32 (RV32IMAC)** | `riscv32imac-unknown-none-elf` | **verified running in QEMU (`-M virt`)** | CLINT `mtime`/`mtimecmp`, `mtvec` trap entry, 30-word trap frame, `mret` |
-| **ARM A/R profile (ARMv7-A/R)** | `armv7a-none-eabi`, **`armv7r-none-eabi`** | **verified running in QEMU (`-M virt -cpu cortex-a15`)**, and compiles for Cortex-R | ARM generic timer (`CNTP_*`), GICv2, `SRSDB`/`RFEIA` frame with banked `SP` |
-| **Xtensa (classic ESP32, LX6)** | `xtensa-esp32-none-elf` | **builds, links and boots in QEMU (`-machine esp32`)**: prints over UART0, timer fires, context switch runs end-to-end then a known defect on resumption (**not** `VERDICT : PASS`; see [`docs/ESP32.md`](docs/ESP32.md)) | `CCOMPARE0` slice, `VECBASE` vector table, hand-written window spill/refill |
-| ESP32-C3 / C6 (RISC-V) | `riscv32imc-unknown-none-elf` (C3), `riscv32imac-…` (C6) | not ported; **C3 is `imc`, not `imac`** (no atomics, see below) and neither has a CLINT/PLIC the tick comes from the Timer Group / SysTimer through the interrupt matrix | |
-| ARM 64-bit, RISC-V 64-bit | `aarch64`, `riscv64*` | not ported (frame assembly must use 64-bit loads/stores; everything else is identical) | |
-| AVR 8-bit (ATmega328P) | `avr-none` | not ported; the **core is already AVR-compatible** (no atomics anywhere, 16-bit `usize`) and the target needs `-C target-cpu=atmega328p` + `avr-gcc` for linking (`lld` cannot link AVR). QEMU can run it via `-M arduino-uno`. | Timer1 CTC + `reti` |
-| Windows, Linux | `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu` | **verified (tests + demos)** | waitable timer / `SIGALRM`, OS-thread or fibre switch |
-
-The Xtensa port is the only one that needs a toolchain beyond `rustc`: `rustup target
-add` is not enough, because `xtensa-esp32-none-elf` exists only in the esp-rs fork of
-LLVM and its `rust-lld` cannot link Xtensa at all. See
-[Building and running the ESP32 port](#building-and-running-the-esp32-port).
-
-Compile-checking the new ports is one command each; both are in the table above
-because they are what CI would run:
-
-```bash
-cargo build --target riscv32imac-unknown-none-elf      # RISC-V 32 port
-cargo build --target armv7r-none-eabi                  # Cortex-R port
-cargo build --target armv7a-none-eabi                  # Cortex-A port
-```
-
-## Measured behaviour (not claims)
-
-| | RISC-V 32 (QEMU `virt`, RV32IMAC, 10 MHz `mtime`) | ARM A/R (QEMU `virt`, Cortex-A15, 62.5 MHz) | Cortex-M (168 MHz) | Linux (this repo, WSL2) | Windows |
-|---|---|---|---|---|---|
-| slice source | CLINT `mtimecmp` | generic timer `CNTP_TVAL` | `SysTick`, `RVR+1` cycles | `CLOCK_MONOTONIC` hrtimer | high-resolution waitable timer |
-| slice accuracy | 10000 ticks = 1000000 ns exactly; comparator rewritten on every switch | 62500 ticks = 1000000 ns exactly; `TVAL` reloaded on every switch | cycle-exact; `SysTick->VAL` is zeroed on **every** switch, so the period cannot drift | 1506 ticks in 1.51 s = 1.00 ms per tick | ~1.5 ms effective per 1 ms request |
-| tick jitter | worst period error 25 µs (emulated timer) | worst period error reported as 0 ticks | a few cycles (measured through `DWT->CYCCNT`) | typ. a few µs, worst ~0.18 ms | typ. ~0.5 ms |
-| fairness (pure RR) | spinner 137 vs observer 128 slices | spinner 108 vs observer 99 slices | exact by construction | 57 vs 57 slices in the demo; bench spread 3 of ~295 | spread 0 (196 vs 196) |
-| automatic exit | 3 tasks reclaimed, ring 2 nodes / 0 dead | 3 tasks reclaimed, ring 2 nodes / 0 dead | same demo logic | same | same |
-
-Hard numbers come from `jitter_bench` and `scheduler::stats()`
-(`worst_period_error_ns`, `last_latency`, `ticks_deferred`, arena accounting).
-The two QEMU columns are produced by the shared demo in `firmware-common/`, whose
-report is the program's verdict (`VERDICT : PASS`) and on RISC-V QEMU's exit
-status.
-
-
-## Honest limits
-
-* **Asymmetric parking on the two `std` backends.** A task that sleeps, blocks or yields is
-  switched away immediately *on every bare-metal port* — the switch is taken on the way out of
-  the blocking critical section. On Windows and Linux it is not: a blocking call can return
-  before its caller has lost the CPU.
-  * *Win32*: the tick thread performs the switch, so the blocking task keeps running until it is
-    suspended, which can be a whole slice later. Measured on one machine: 197 of 266 sleeps in
-    the fidelity scenario returned with fewer ticks elapsed than requested.
-  * *POSIX*: the `SIGALRM` handler has no idle context to switch to when nothing is runnable, so
-    it returns and the blocked fibre simply resumes. A scenario that keeps every task blocked
-    (which is exactly what a strict sleep test does) hangs there.
-  The kernel's bookkeeping is correct in both cases — the task is marked `Blocked`, skipped by
-  `ring::next_runnable`, and parked a moment later, and `stats().blocks_without_current` stays
-  zero — but a task measuring its own sleep cannot see that. `examples/sleep_fidelity.rs` reports
-  this per platform and runs its strict form only where the port declares
-  `arch::parks_synchronously()`. Fixes: an idle fibre for POSIX, a per-task park event for
-  Windows.
-
-* **Cycle-exact slices are a bare-metal property.** A hosted OS adds timer
-  resolution and scheduler jitter; the kernel measures and reports it instead of
-  hiding it. On Windows the *effective* period is `slice + switch cost`, because
-  the timer is re-armed after the switch so that every task still receives a
-  full slice.
-* **Blocking is opt-in and bounded.** `sync::Mutex` is the only blocking primitive: a
-  task that cannot take the lock is marked `Blocked` and switched away, and
-  `try_lock_for` bounds the wait. There is still no `sleep`/`join`-style syscall, and on
-  the POSIX fibre backend a task that blocks on anything *else* (I/O) stalls the whole
-  kernel, since every task there shares one OS thread.
-* **Lock discipline is enforced, not suggested.** Every lock carries a monotonic
-  `LockId`; acquiring one whose id is not strictly greater than the last you hold is
-  refused (`LockError::OrderViolation`). That is what removes the circular-wait
-  condition, and the price is that locks must be created in the order they will be
-  acquired.
-* **One known scheduler bug, reproduced on hardware.** A sleep can occasionally return
-  *early*: observed on an STM32F103 as roughly one call in fifteen, always shortly after
-  another task is created or destroyed, and always a fraction of the requested duration
-  (never a hang, never a crash). The evidence points at `scheduler::block_current`, whose
-  "am I the current task?" check returns without blocking when `KERNEL.current` is null or
-  stale which is why the examples annotate an early return with `EARLY`. Not fixed yet,
-  and documented rather than hidden.
-* **No priorities**, so worst-case lateness is `(N-1)` slices. That is inherent
-  to pure round robin, which the design requires.
-* **Cortex-M FPU:** the port disables lazy FP stacking and saves no S-registers,
-  so use `thumbv7m-none-eabi` (soft-float) or extend `PendSV` for S16–S31.
-* **Cortex-M stacks:** task 0 (`main`) runs on MSP, which doubles as the kernel
-  stack. Keep `main` light or make it the idle loop.
-* **RISC-V:** the interrupt controller is machine mode only, and the interval is
-  expressed in `mtime` ticks, so `SchedulerConfig::timer_hz` is required (there is
-  no portable way to read the counter frequency from the hart). Chips without a
-  CLINT (ESP32-C3's SYSTIMER, say) point `arch::configure_timer` at their own
-  registers.
-* **ARM A/R profile:** a GICv2 will not deliver a group-1 interrupt to a *secure*
-  CPU, and QEMU's `virt` boots into secure EL1. That is why the runner passes
-  `secure=off`; on a board where a secure monitor exists, use
-  `arch::ArmConfig::secure()` (group 0/FIQ) or have the monitor drop you to
-  non-secure EL1. See `docs/DESIGN.md` §5.
-* TCBs and stacks are recycled once a task returns do not keep raw pointers
-  into a task after it has finished.
-
-## Layout
-
-```
 src/
-  lib.rs            public API + crate docs
-  tcb.rs            TaskControlBlock, TaskState, Kernel (KERNEL), layout asserts
-  ring.rs           circular doubly-linked ring: insert_after, unlink, next_runnable, checker
-  scheduler.rs      policy: init/config, schedule_next, counters, stats, spawn, reclamation
-  trampoline.rs     task entry + automatic teardown (unlink, counters, immediate switch)
-  arena.rs          bump allocator with block recycling (TCBs, closures, task stacks)
-  closure.rs        placing and running a `FnOnce` with no heap
-  config.rs         Slice, SchedulerConfig, PlatformLimits, ConfigError
-  critical.rs       critical sections (interrupts / signal mask / kernel lock)
-  smp.rs            CpuArch HAL: core id, spinlock, IPI per-target implementations
-  sync.rs           sleeping Mutex, LockId ordering enforcement, timeout + back-off
-  time.rs           sleep with units: Duration -> absolute deadlines on the global tick
-  app_support.rs    what `#[rrkernel]` calls: configure, the log black box, fault handlers
-  arch/
-    cortex_m.rs     SysTick + PendSV + frame construction (thumbv6m-safe assembly)
-    arm_ar.rs       ARMv7-A/R: generic timer + GICv2 + SRSDB/RFEIA frame (banked SP)
-    riscv.rs        RV32 machine mode: CLINT mtime/mtimecmp + mtvec trap frame + mret
-    xtensa.rs       ESP32 LX6: VECBASE vector table + CCOMPARE0 + window spill/refill
-    win32.rs        tick thread + SuspendThread/ResumeThread baton
-    posix.rs        SIGALRM + x86-64 fibre switch
-firmware-common/    the demo application, written once for every architecture
-firmware-cortex-m/  bare-metal demo: vector table, link.x, three tasks, debugger-readable report
-firmware-riscv/     RISC-V demo for QEMU -M virt (UART + SiFive finisher exit)
-firmware-arm-a/     ARM A/R demo for QEMU -M virt (PL011 + semihosting exit)
-firmware-esp32/     ESP32 (Xtensa) demo for Espressif's QEMU -machine esp32 (UART0)
-examples/           roundrobin_demo, jitter_bench, smoke
-  cortex-m-bluepill/    standalone cortex-m-rt app on an STM32F103C8 (RTT output)
-  cortex-m-blackpill/   the same on an STM32F401, driving the LED through stm32f4xx-hal
-rrkernel-macros/    the `#[rrkernel]` proc-macro (host-only: syn/quote)
-tests/              ring / arena / closure / ABI invariants
-docs/               DESIGN.md, PORTING.md, ESP32.md
-scripts/            run-linux.sh, qemu-monitor-probe.ps1 (inspect a hung QEMU guest)
-LICENSE             MIT
+  lib.rs          the public surface, in one file
+  scheduler.rs    policy: init/config, schedule_next, blocking, wake, stats, spawn, reclaim
+  event.rs        Signal, WaitQueue, park/wake, yield_now, wait_until
+  exec.rs         block_on, Waker, Sleep, spawn_async
+  hal.rs          KernelDelay, Blocking facade, MutexDevice (embedded-hal / -async)
+  io.rs           Pipe: ISR-driven byte ring, embedded-io / -async Read+Write
+  ring.rs tcb.rs arena.rs closure.rs trampoline.rs thread.rs time.rs config.rs
+  arch/           one file per port: cortex_m, riscv, arm_ar, xtensa, win32, posix
+  app_support.rs  what #[rrkernel] expands into, plus the RAM black-box log
+examples/
+  roundrobin_demo.rs sleep_fidelity.rs io_layers.rs smoke.rs jitter_bench.rs
+  cortex-m-bluepill/  (F103: main + `fidelity` + `layers` binaries)
+  cortex-m-blackpill/ (F401)
+firmware-*/       the shared demo, cross-compiled per architecture (QEMU verdicts)
+docs/             DESIGN.md (engineering record) · PORTING.md (port checklist) · ESP32.md
+tests/            ring invariants · ring property tests · event state machines
 ```
 
-More detail: [`docs/DESIGN.md`](docs/DESIGN.md),
-[`docs/PORTING.md`](docs/PORTING.md) and
-[`docs/ESP32.md`](docs/ESP32.md) (the Xtensa port's status page).
+## Roadmap
 
-## Contributing bugs, and more hardware
+**Core kernel**
 
-This kernel is small enough that a useful contribution is a weekend, not a quarter. The most
-valuable things, roughly in order:
+- [x] Preemptive round robin, one priority level, pure by construction
+- [x] Slice planned in cycles at init, validated, restarted on every switch
+- [x] Bump arena + deferred reclamation: spawn/exit at steady state
+- [x] `(N-1)` worst-case bound instrumented in `stats()`
+- [x] Sleep precision verified on hardware (601 sleeps, 0 early)
+- [x] Idle path that genuinely parks the core (1 `wfi` per tick, measured)
+- [ ] `max_tasks` cap and a published switch-cost-vs-N benchmark
+- [ ] Stack canary / high-water marks in `stats()`
+- [ ] `plan_timer` floor raised to 10× the measured switch cost (~800 cycles)
 
-1. **Fix a known bug.** They are characterized, not mysterious:
-   * a `sleep` can occasionally return *early* (about one call in fifteen on an STM32F103,
-     shortly after a task is created or destroyed). Evidence and the prime suspect —
-     `scheduler::block_current`'s "am I the current task?" check are under *Honest limits*.
-   * the Xtensa resume defect: an instruction trace and a disproved theory in `docs/ESP32.md`.
-   * `firmware-cortex-m`'s `REPORT` is a non-`mut` static, so it lands in `.rodata` (flash) and
-     its `write_volatile`s can never take effect. Two lines plus a re-run.
-2. **Port it to a board you own.** `docs/PORTING.md` is a checklist rather than a wish list:
-   the port surface is about eleven functions, most of a port is comments about the target's
-   quirks, and a Cortex-M port is essentially two files (`memory.x` plus a `Cargo.toml`)
-   because the kernel supplies the trap entries. A port that runs the shared demo to
-   `VERDICT : PASS` is a complete contribution.
-3. **Bring up a second core.** The HAL, the validation and the lock-ordering rules exist; what
-   is missing is `arch::start_secondary_cores()` and per-core `current_tcb`. Success criterion
-   is in the roadmap: the demo asserts that *both* cores took ticks, under `-smp 2` in QEMU.
-4. **Give `sync` a runtime test.** A host test hammering a `static Mutex` from N OS threads
-   would cover contention, ordering rejection and the timeout/back-off path with no hardware.
-5. **Measure something and publish the number.** The host backends especially: the Linux path
-   is scripted but unmeasured, and the Windows numbers above come from one machine at a 1 ms
-   slice where the OS timer is the bottleneck. Better data is a real contribution. macOS is
-   unported and the exact work list is small (three struct layouts, one timer).
+**Concurrency**
 
-House rules, learned the hard way they are why these documents read the way they do:
+- [x] `park`/`wake`/`TaskId`, `Signal`, `WaitQueue`, `yield_now`, `wait_until`
+- [x] Race-free waits: condition checked inside the blocking critical section
+- [x] `sync::Mutex` with static lock order and timeouts
+- [ ] `sync::Mutex` and the shared bus exercised on real hardware
+- [ ] Interleaving tests over a mock arch layer
 
-* **Never make a status table prettier than the truth.** Most of this kernel's bugs were found
-  by distrusting a status line, and the most expensive ones were the ones a document had
-  quietly gotten wrong.
-* **A silent failure is a bug.** Almost every bring-up failure here looked like a hang: an ISR
-  that was never wired into the vector table, a clock that never ticked, a stack pointer of
-  zero. If a new path can fail, it has to say so which is why the fault handlers log, and
-  why the RAM black box keeps the last thing the kernel said even with no console attached.
-* **Ports must not skip the contract.** `on_tick()`, the `critical_enter` token polarity ("zero
-  when interrupts were already masked"), and the full-slice restart are documented in
-  `docs/PORTING.md` because every shortcut around them has produced a real bug in this tree.
+**Async & I/O**
 
-A contribution that makes the claim *smaller* "this is broken, here is the trace" is as
-welcome as a feature. That is how the open bugs above were found.
+- [x] `block_on`, `Waker`, `Sleep`, `spawn_async` (core-only, no executor dependency)
+- [x] `embedded-hal` + `embedded-hal-async`: delays, blocking facade, shared-bus device
+- [x] `embedded-io` + `embedded-io-async`: ISR-driven `Pipe`, 0 slices while blocked
+- [ ] `SpiDevice` shared-bus impl (I2C is done; SPI follows the same shape)
+- [ ] CAN / SD / ethernet / USB adapters
+- [ ] 1-hour shared-bus soak test on hardware
+
+**Ports**
+
+- [x] Cortex-M (M0/M0+/M3/M4/M33) — **verified on an STM32F103C8**
+- [x] RISC-V 32 (`riscv32imac`) — QEMU verdict
+- [x] ARM A/R (`armv7a`, `armv7r`) — QEMU verdict
+- [x] Windows and Linux host backends — 23 tests each
+- [ ] Xtensa LX6 (ESP32): boot, switch and UART work; the resume is wrong
+- [ ] macOS/BSD (POSIX layout adaptation), AVR (ATmega328P)
+- [ ] Multi-core bring-up: `active_cores > 1`, `-smp 2`, per-core current state
+
+**Time base**
+
+- [x] `arch::cycle_counter()` on Cortex-M (DWT) and RISC-V (`rdcycle`)
+- [x] `DWT->CYCCNT` measured across a *verified* sleep — it keeps counting, so DWT is usable
+- [ ] `Instant` + 64-bit counter extension, so deadlines stop being tick counts
+
+**Tooling & docs**
+
+- [x] CI: fmt, clippy, tests, six-target builds (dev **and** release), QEMU verdicts
+- [x] Property tests for the ring, model-checked against a `Vec` reference
+- [x] `docs/DESIGN.md` §8: the measured engineering record, bugs included
+- [ ] `docs/GUARANTEES.md` (bounds, how each was measured, on which chip)
+- [ ] `docs/ASYNC_AND_IO.md` (the three layers, the wake protocol, timeout rules)
+- [ ] Host tick source in the `io_layers` scenario; `layers` firmware RTT output
+
+## Contributing
+
+The most useful contributions, roughly in order:
+
+1. **A board.** Port it to what you own — `docs/PORTING.md` is a checklist of about eleven functions,
+   and a Cortex-M port is two files. A port that runs the shared demo to `VERDICT : PASS` is done.
+2. **A failing test.** "This is broken, here is the trace" is as welcome as a feature; that is how
+   most of the bugs in `docs/DESIGN.md` §8 were found.
+3. **A measurement.** Hardware numbers with the chip and clock attached.
+
+House rules, learned the hard way: never make a status table prettier than the truth; a silent failure
+is a bug, not a hang; and a port must not skip the contract (`on_tick`, the `critical_enter` token
+polarity, the full-slice restart).
 
 ## License
 
-MIT see [`LICENSE`](LICENSE). Use it on any board you like, including commercially; if you
-port it somewhere, the only thing asked in return is that `docs/PORTING.md` gets the quirks
-you discovered, so the next person does not have to find them the way you did.
-
-
-
-Every claim above is meant to be checkable, and the command that checks it sits next to it.
-Where something is *not* verified the multi-core path, `sync` at runtime, the Xtensa port,
-the early-returning sleep it says so in as many words rather than being left to
-implication. That is deliberate: most of the bugs this kernel has had were found by
-distrusting a status line, and the ones that cost the most were the ones a document had
-quietly gotten wrong.
-
-
-## What happens next
-
-In the order that makes each step verifiable rather than hopeful:
-
-1. **Finish the Xtensa/ESP32 port** to `VERDICT : PASS`. The blocking defect is
-   localized (the switch path runs end-to-end; the *resume* lands in the wrong place,
-   with `a0` pointing into the kernel vector slot) and the instrumentation that found
-   it is still in the tree. Next: drop the trace calls out of the restore path, then
-   dump the 32-word frame, then decide whether a full window-chain spill is needed at
-   all in a call0 build. `docs/ESP32.md` has the exact evidence.
-2. **Make `active_cores > 1` real** per-core `current_tcb` after offset 0, the global
-   interlock in `critical_enter`, `arch::start_secondary_cores()`, and then a RISC-V
-   `-smp 2` run (a hart lottery on `mhartid` works with `-bios none` because QEMU
-   starts every hart at the reset vector) followed by ARM `-smp 2` (PSCI `CPU_ON` +
-   GICv2 `SGIR`). Success criterion: the shared demo asserts that *both* cores took
-   ticks, in QEMU.
-3. **Exercise `sync` end-to-end.** A host test that hammers a `static Mutex` from N OS
-   threads would cover contention, ordering rejection and the timeout/back-off path
-   without a board the cheapest way to promote the layer from "compiles" to
-   "verified". Then a cross-core contention demo on `-smp 2`.
-4. **Cortex-M0 / AVR / `riscv32imc`.** The kernel core is already free of atomics and
-   16-bit-`usize`-clean; what these need is a port (`thumbv6m` exists today, `avr-none`
-   needs `-C target-cpu=atmega328p` + `avr-gcc`, and `riscv32imc` needs the ESP32-C3
-   Timer Group / SysTimer tick source instead of a CLINT).
-5. **Real hardware working, with one board still to be confirmed.**
-   `examples/cortex-m-bluepill/` (STM32F103C8) is verified end to end: RTT over the probe,
-   100/250/500 ms threads, `sleep_secs`, `VERDICT : PASS`.
-   `examples/cortex-m-blackpill/` (STM32F401, LED on PC13 through `stm32f4xx-hal`) runs the
-   kernel and blinks correctly, but its RTT output is blocked by a *tool* problem on that
-   board: `probe-rs` reports a successful flash while the image's initial stack pointer
-   lands as zero in the device, so the core faults before executing anything. Verify with
-   `probe-rs read --chip STM32F401CE b32 0x08000000 2` (must read `20010000 08000195`) and
-   flash with `--connect-under-reset` if it does not. Also worth doing: an equivalent
-   "just use the ecosystem" example for RISC-V (`riscv-rt`) so the pattern is uniform, and
-   a hardware example that exercises `sync` and `active_cores`, which today are only
-   compiled.
-
+MIT — see [LICENSE](LICENSE). Use it on any board, including commercially. If you port it somewhere,
+the only thing asked in return is that `docs/PORTING.md` gets the quirks you discovered.
