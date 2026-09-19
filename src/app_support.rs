@@ -176,7 +176,25 @@ pub fn exit_main() -> ! {
 }
 
 /// The body of the `HardFault` that `app!` installs.
-#[cfg(target_arch = "arm")]
+///
+/// # Why this is gated on the profile, not just on `target_arch`
+/// `target_arch = "arm"` is **also true for the A/R-profile port** (`armv7a-none-eabi`,
+/// `armv7r-none-eabi`), but `CFSR`/`HFSR`/`BFAR`/`MMFAR` are M-profile `SCB` registers and
+/// `mrs r0, psp` is an M-profile instruction. Assembling this body for A/R failed:
+///
+/// ```text
+/// error: invalid operand for instruction
+///   --> src\app_support.rs:188:32
+/// note: instantiated into assembly here
+///   |     mrs r0, psp
+/// ```
+///
+/// Only the **dev** profile reported it: the release profile sets `lto = "fat"`, so the
+/// library is built as bitcode and this function — which no A/R firmware calls — is dropped
+/// before codegen, leaving the assembler nothing to reject. Gating on
+/// `target_feature = "mclass"` makes the two profiles agree, so a stale `VERDICT : PASS`
+/// can no longer hide a build failure.
+#[cfg(all(target_arch = "arm", target_feature = "mclass"))]
 pub fn hard_fault() -> ! {
     let cfsr = unsafe { core::ptr::read_volatile(0xE000_ED28 as *const u32) };
     let hfsr = unsafe { core::ptr::read_volatile(0xE000_ED2C as *const u32) };
@@ -194,6 +212,41 @@ pub fn hard_fault() -> ! {
     log_fmt(format_args!(
         "    BFAR {:#010x} MMFAR {:#010x} PSP {:#010x} faulting PC {:#010x}\r\n",
         bfar, mmfar, psp, pc
+    ));
+    park()
+}
+
+/// A/R-profile fault report — the counterpart of the M-profile body above.
+///
+/// There is no `SCB` on A/R, so there is no `CFSR`/`HFSR`/`BFAR`/`MMFAR` to read and no `PSP`
+/// to sample; what the profile does have is the mode register. `mrs <rd>, cpsr` is the same
+/// idiom [`crate::arch`]'s A/R port uses in `current_cpsr()`, so it is known to assemble for
+/// this target rather than merely expected to.
+///
+/// In practice an A/R application never reaches this: the A/R port reports faults through its
+/// own trap entry. It exists so that `app!` still links on such a target, and so that the
+/// failure mode is a printed reason instead of a silent park.
+#[cfg(all(target_arch = "arm", not(target_feature = "mclass")))]
+pub fn hard_fault() -> ! {
+    let cpsr: u32;
+    let sp: u32;
+    let lr: u32;
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, cpsr",
+            out(reg) cpsr,
+            options(nomem, nostack, preserves_flags)
+        );
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack));
+        core::arch::asm!("mov {}, lr", out(reg) lr, options(nomem, nostack));
+    }
+    log_fmt(format_args!(
+        "!!! fault (ARM A/R profile)  CPSR {:#010x} SP {:#010x} LR {:#010x}\r\n",
+        cpsr, sp, lr
+    ));
+    log_fmt(format_args!(
+        "    no CFSR/HFSR on this profile (those are M-profile SCB registers); \
+         the A/R port reports through its own trap entry\r\n"
     ));
     park()
 }
