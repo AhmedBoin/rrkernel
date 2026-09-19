@@ -32,6 +32,18 @@ exclude = [
 name = "rrkernel"
 path = "src/lib.rs"
 
+# --- docs.rs ---------------------------------------------------------------
+# docs.rs builds for a desktop target, where this crate needs the `std` feature to have a backend at
+# all (a host target without it is a deliberate `compile_error!`). Without this, the docs build would
+# fail and the crate would look unbuildable.
+#
+# The same fact is why `cargo publish` needs `--target thumbv7m-none-eabi`: its verification build
+# defaults to the host, and the host is not a target this crate claims to support by default. The
+# command that works is in the README ("Publishing" section).
+[package.metadata.docs.rs]
+features = ["std"]
+default-target = "x86_64-unknown-linux-gnu"
+
 # --- Workspace -------------------------------------------------------------
 # `firmware-cortex-m` is a separate bare-metal binary (own linker script, own
 # target), so it is a member but *not* a default member: a plain `cargo build`
