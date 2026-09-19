@@ -353,6 +353,23 @@ status.
 
 ## Honest limits
 
+* **Asymmetric parking on the two `std` backends.** A task that sleeps, blocks or yields is
+  switched away immediately *on every bare-metal port* — the switch is taken on the way out of
+  the blocking critical section. On Windows and Linux it is not: a blocking call can return
+  before its caller has lost the CPU.
+  * *Win32*: the tick thread performs the switch, so the blocking task keeps running until it is
+    suspended, which can be a whole slice later. Measured on one machine: 197 of 266 sleeps in
+    the fidelity scenario returned with fewer ticks elapsed than requested.
+  * *POSIX*: the `SIGALRM` handler has no idle context to switch to when nothing is runnable, so
+    it returns and the blocked fibre simply resumes. A scenario that keeps every task blocked
+    (which is exactly what a strict sleep test does) hangs there.
+  The kernel's bookkeeping is correct in both cases — the task is marked `Blocked`, skipped by
+  `ring::next_runnable`, and parked a moment later, and `stats().blocks_without_current` stays
+  zero — but a task measuring its own sleep cannot see that. `examples/sleep_fidelity.rs` reports
+  this per platform and runs its strict form only where the port declares
+  `arch::parks_synchronously()`. Fixes: an idle fibre for POSIX, a per-task park event for
+  Windows.
+
 * **Cycle-exact slices are a bare-metal property.** A hosted OS adds timer
   resolution and scheduler jitter; the kernel measures and reports it instead of
   hiding it. On Windows the *effective* period is `slice + switch cost`, because

@@ -772,3 +772,16 @@ pub unsafe fn on_task_reclaimed(_tcb: *mut TaskControlBlock) {}
 pub unsafe fn is_pinned(_tcb: *mut TaskControlBlock) -> bool {
     false
 }
+
+/// Whether a blocking call (`sleep`, `lock`, `park`) is guaranteed to have taken the caller off
+/// the CPU **before it returns**.
+///
+/// `true` on this portrue here: the switch is taken on the way out of the masked region.
+///
+/// This matters because a task measures its own sleep around the call: if the switch is
+/// asynchronous, the task can observe `elapsed == 0` and think it woke up early, even though
+/// the kernel booked the wait correctly. `examples/sleep_fidelity.rs` reports this property
+/// and gates its strict assertions on it.
+pub fn parks_synchronously() -> bool {
+    true
+}

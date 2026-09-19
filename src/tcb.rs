@@ -251,6 +251,14 @@ pub struct Kernel {
     pub pending_free: UnsafeCell<*mut TaskControlBlock>,
     /// Number of deferred-free reclaims performed.
     pub reclaimed: UnsafeCell<u64>,
+    /// Times a task tried to block (sleep / lock / park) with **no current task**, i.e. from
+    /// interrupt or idle context where there is nothing to switch away.
+    ///
+    /// This must stay zero. It is a counter rather than silently returning because returning is
+    /// exactly the historical bug: `sleep_ticks` on a null current task did nothing at all, so
+    /// the sleep returned immediately and looked like an early wake-up. A non-zero value here
+    /// means a caller is blocking from a context that cannot block.
+    pub blocks_without_current: UnsafeCell<u64>,
     /// Init-time configuration.
     pub config: UnsafeCell<KernelConfig>,
 }
@@ -280,6 +288,7 @@ impl Kernel {
             shutdown: UnsafeCell::new(false),
             pending_free: UnsafeCell::new(ptr::null_mut()),
             reclaimed: UnsafeCell::new(0),
+            blocks_without_current: UnsafeCell::new(0),
             config: UnsafeCell::new(KernelConfig::default_const()),
         }
     }

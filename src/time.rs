@@ -77,11 +77,12 @@ pub fn deadline_add(deadline: u64, d: Duration) -> u64 {
 /// Sleep until an absolute deadline from [`deadline_after`] / [`deadline_add`]. Already
 /// being past the deadline is not an error: it returns immediately, and the caller decides
 /// whether to skip ahead (see [`ticks_for`]).
+///
+/// This re-checks the deadline in a loop, so a wake-up that arrives early is harmless — it just
+/// blocks again. (A clock that jumps forward is a different fault: see
+/// [`crate::scheduler::sleep_until_tick`].)
 pub fn sleep_until(deadline: u64) {
-    let n = now();
-    if deadline > n {
-        scheduler::sleep_ticks(deadline - n);
-    }
+    scheduler::sleep_until_tick(deadline);
 }
 
 /// Sleep for `ns` nanoseconds (rounded up to a whole tick).

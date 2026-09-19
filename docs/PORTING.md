@@ -33,6 +33,7 @@ fn exit_current_task_forever() -> !;      // what a finished task does
 fn idle_forever() -> !;                   // nothing runnable
 unsafe fn on_task_reclaimed(tcb: *mut TaskControlBlock);
 unsafe fn is_pinned(tcb: *mut TaskControlBlock) -> bool;
+fn parks_synchronously() -> bool;         // does a blocking call park the caller *before* returning?
 fn mark_running();
 fn shutdown(code: i32) -> !;
 ```

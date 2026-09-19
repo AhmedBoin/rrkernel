@@ -81,3 +81,8 @@ required-features = ["std"]
 name = "smoke"
 path = "examples/smoke.rs"
 required-features = ["std"]
+
+[[example]]
+name = "sleep_fidelity"
+path = "examples/sleep_fidelity.rs"
+required-features = ["std"]

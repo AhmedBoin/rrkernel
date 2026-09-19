@@ -60,6 +60,10 @@ pub struct SchedulerStats {
     pub timer_hz: u32,
     /// Dead tasks whose memory has been reclaimed by deferred-free.
     pub reclaimed: u64,
+    /// Times a task tried to block with no current task. Must stay zero: see
+    /// [`crate::tcb::Kernel::blocks_without_current`]. Non-zero means a block came from
+    /// interrupt or idle context and therefore did *not* wait at all.
+    pub blocks_without_current: u64,
     /// Arena usage.
     pub arena: ArenaStats,
     /// Whether the tick source is live.
@@ -220,6 +224,7 @@ pub fn stats() -> SchedulerStats {
             slice_cycles: cfg.slice_cycles,
             timer_hz: cfg.timer_hz,
             reclaimed: *KERNEL.reclaimed.get(),
+            blocks_without_current: *KERNEL.blocks_without_current.get(),
             arena: (*arena()).stats(),
             running: *KERNEL.running.get(),
         }
@@ -518,36 +523,119 @@ pub unsafe fn record_period_error(value: u32) {
 // `ring::next_runnable`, which is what makes both blocking and waking O(1) — nothing has
 // to be searched to put it back, and its place in the rotation is preserved.
 
-/// Mark the calling task blocked on `resource` and ask for an immediate switch.
+/// What a blocking call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockOutcome {
+    /// The caller is switched away and will resume when woken or its deadline passes.
+    Blocked,
+    /// The deadline had already passed, so nothing was waited for. Not an error.
+    AlreadyPast,
+    /// **No current task**: called from interrupt or idle context, where there is nothing to
+    /// switch away from. The wait did *not* happen; counted in `stats().blocks_without_current`.
+    NoCurrentTask,
+}
+
+/// Mark the current task blocked — **the caller must already hold the kernel critical section**.
 ///
-/// `resource` is a [`crate::sync::LockId`], or 0 for a plain bounded sleep.
-/// `deadline_tick` is an absolute slice-tick count (0 = wait indefinitely).
+/// This is the primitive every wait in the kernel builds on, and its contract is the reason
+/// sleeps stopped returning early:
 ///
-/// This is the O(1) heart of `Mutex::lock`: the caller leaves the CPU at once instead of
-/// spinning through its slice. The switch is *requested* rather than performed here, so
-/// the caller is guaranteed to be off the CPU before it next runs — on bare metal the
-/// pending interrupt is taken the moment the critical section ends.
-pub fn block_current(resource: u32, deadline_tick: u64) {
-    {
-        let g = critical::enter();
-        unsafe {
-            let me = KERNEL.current();
-            if me.is_null() {
-                return;
-            }
-            (*me).blocked_on = resource;
-            (*me).block_deadline = deadline_tick;
-            (*me).state = TaskState::Blocked;
-        }
-        drop(g);
+/// * the deadline, the state change and the switch-pend happen inside the caller's *one*
+///   critical section, so no tick sweep can observe "marked blocked" without the switch already
+///   being pended;
+/// * `blocked_on`/`block_deadline` are written *before* `state`, and the state store is last,
+///   so a tick that runs immediately afterwards sees a fully formed waiter.
+///
+/// On [`BlockOutcome::Blocked`] the caller must leave the critical section for the switch to
+/// happen: on bare metal the pending `PendSV` is taken the moment the mask lifts.
+///
+/// # Safety
+/// Caller holds a critical section, and is running on the current task (or is willing to be
+/// told that it is not).
+pub unsafe fn mark_blocked_locked(resource: u32, deadline_tick: u64) -> BlockOutcome {
+    let me = KERNEL.current();
+    if me.is_null() {
+        // Interrupt or idle context. Counted and asserted rather than silently ignored: a
+        // silent return here makes the caller's wait vanish, which is exactly how a sleep came
+        // to "wake up early" — it never blocked at all.
+        *KERNEL.blocks_without_current.get() += 1;
+        debug_assert!(
+            false,
+            "rrkernel: blocking wait attempted with no current task (interrupt or idle context)"
+        );
+        return BlockOutcome::NoCurrentTask;
     }
+    // Already past the deadline (or a zero-length wait): do not pretend to have waited.
+    if deadline_tick != 0 && *KERNEL.ticks.get() >= deadline_tick {
+        return BlockOutcome::AlreadyPast;
+    }
+    (*me).blocked_on = resource;
+    (*me).block_deadline = deadline_tick;
+    (*me).state = TaskState::Blocked;
     crate::arch::request_switch();
+    BlockOutcome::Blocked
+}
+
+/// Block the calling task until `resource` is woken or the absolute `deadline_tick` passes.
+///
+/// `resource` is a [`crate::sync::LockId`], or 0 for a plain sleep. `deadline_tick == 0` means
+/// "no deadline" — an unbounded wait, which callers must opt into explicitly.
+pub fn block_until_tick(resource: u32, deadline_tick: u64) -> BlockOutcome {
+    let g = critical::enter();
+    let outcome = unsafe { mark_blocked_locked(resource, deadline_tick) };
+    drop(g);
+    outcome
+}
+
+/// Block the calling task for **at least** `ticks` slice ticks.
+///
+/// The deadline is computed *inside* the critical section. Reading the tick first and blocking
+/// afterwards — which is what this used to do — leaves a window: a tick landing in it makes the
+/// deadline one tick short, so the sleep returns early. The symptom is intermittent and shows up
+/// most often right after a spawn or an exit, because that is when a switch and a just-latched
+/// tick most often coincide.
+pub fn block_for_ticks(resource: u32, ticks: u64) -> BlockOutcome {
+    let g = critical::enter();
+    let deadline = unsafe { *KERNEL.ticks.get() }.wrapping_add(ticks);
+    let outcome = unsafe { mark_blocked_locked(resource, deadline) };
+    drop(g);
+    outcome
+}
+
+/// Absolute wake-up tick `ticks` from now, captured atomically with the counter.
+///
+/// For callers that need **one** deadline across several waits (a retry loop that times out).
+/// Documented tolerance: a tick landing between this call and the first block shifts the
+/// deadline by one tick, so a timeout can fire up to one slice early. Sleeps deliberately do not
+/// have that tolerance — they compute their deadline inside the blocking section.
+pub fn deadline_after_ticks(ticks: u64) -> u64 {
+    let g = critical::enter();
+    let d = unsafe { *KERNEL.ticks.get() }.wrapping_add(ticks);
+    drop(g);
+    d
 }
 
 /// Sleep for at least `ticks` slice ticks (the only clock the kernel has).
 pub fn sleep_ticks(ticks: u64) {
-    let deadline = unsafe { *KERNEL.ticks.get() }.wrapping_add(ticks);
-    block_current(0, deadline);
+    let _ = block_for_ticks(0, ticks);
+}
+
+/// Sleep until an absolute tick, tolerating spurious wake-ups: a wake that arrives early simply
+/// blocks again, because the loop re-checks the deadline.
+///
+/// What this **cannot** fix: a clock that jumps forward. A double-counted tick moves `now()`
+/// past the deadline and the loop exits immediately — that is a time-base fault, not a wake-up
+/// fault, and it is why the deadline clock moves off the slice counter in the next phase.
+pub fn sleep_until_tick(deadline_tick: u64) {
+    while tick_count() < deadline_tick {
+        match block_until_tick(0, deadline_tick) {
+            BlockOutcome::Blocked => {}
+            // Deadline passed while we were deciding: done.
+            BlockOutcome::AlreadyPast => break,
+            // Cannot block here at all; stop rather than spin.
+            BlockOutcome::NoCurrentTask => break,
+        }
+    }
 }
 
 /// Make every task blocked on `resource` runnable again. O(ring).
@@ -602,6 +690,19 @@ unsafe fn wake_expired() {
             break;
         }
     }
+}
+
+/// Times a blocking wait was attempted with no current task (interrupt or idle context).
+///
+/// Must stay zero: a non-zero value means some path called `sleep`/`lock`/`park` from a context
+/// that has nothing to switch away from, so that wait did not happen at all. It is a counter as
+/// well as a debug assertion because the assertion is compiled out in release, and this is
+/// exactly the class of bug that looks like "the sleep woke up early".
+pub fn blocks_without_current() -> u64 {
+    let g = critical::enter();
+    let n = unsafe { *KERNEL.blocks_without_current.get() };
+    drop(g);
+    n
 }
 
 /// Number of tasks currently blocked (waiting for a lock, or sleeping).

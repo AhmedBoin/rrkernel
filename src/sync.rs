@@ -188,34 +188,54 @@ impl<T> Mutex<T> {
 
     /// Take the lock, **sleeping** until it is free.
     ///
-    /// On contention the caller's TCB is marked `Blocked` on this lock's id and the port
-    /// is asked for an immediate switch, so the waiter stops consuming CPU instead of
-    /// spinning through its slice.
+    /// On contention the caller's TCB is marked `Blocked` on this lock's id and the port is asked
+    /// for an immediate switch, so the waiter stops consuming CPU instead of spinning through its
+    /// slice.
+    ///
+    /// The "is it free?" test and the state change share **one** critical section. Doing them in
+    /// two steps — which is what this used to do — loses a wake-up: if `unlock` ran in between,
+    /// its `wake_blocked_on` found no waiter to wake, and this task then parked with no deadline:
+    /// blocked forever on a lock that was already free.
     pub fn lock(&self) -> Result<MutexGuard<'_, T>, LockError> {
         loop {
+            let g = crate::critical::enter();
             if self.try_acquire()? {
+                drop(g);
                 return Ok(MutexGuard { lock: self });
             }
-            crate::scheduler::block_current(self.header.id.0, 0);
+            let outcome = unsafe { crate::scheduler::mark_blocked_locked(self.header.id.0, 0) };
+            drop(g); // the switch happens as this section ends
+            if outcome == crate::scheduler::BlockOutcome::NoCurrentTask {
+                return Err(LockError::NotRunning);
+            }
         }
     }
 
-    /// Take the lock, giving up after `timeout_ms` (measured in scheduler ticks, the
-    /// only clock this kernel has).
+    /// Take the lock, giving up after `timeout_ms` (measured in scheduler ticks, the only clock
+    /// this kernel has).
+    ///
+    /// Deadline capture has the tolerance documented on
+    /// [`crate::scheduler::deadline_after_ticks`]: a tick landing between capturing it and the
+    /// first block shifts the timeout by up to one slice.
     pub fn try_lock_for(&self, timeout_ms: u64) -> Result<MutexGuard<'_, T>, LockError> {
-        if self.try_acquire()? {
-            return Ok(MutexGuard { lock: self });
-        }
-        let deadline = crate::scheduler::tick_count() + ms_to_ticks(timeout_ms);
+        let deadline = crate::scheduler::deadline_after_ticks(ms_to_ticks(timeout_ms));
         loop {
-            crate::scheduler::block_current(self.header.id.0, deadline);
-            // Re-try before checking the clock: if the lock was released *and* the
-            // deadline passed in the same tick, succeeding is the better answer.
+            let g = crate::critical::enter();
             if self.try_acquire()? {
+                drop(g);
                 return Ok(MutexGuard { lock: self });
             }
+            // Check the clock *after* trying to take it: succeeding in the same tick the deadline
+            // passes is the better answer.
             if crate::scheduler::tick_count() >= deadline {
+                drop(g);
                 return Err(LockError::Timeout);
+            }
+            let outcome =
+                unsafe { crate::scheduler::mark_blocked_locked(self.header.id.0, deadline) };
+            drop(g);
+            if outcome == crate::scheduler::BlockOutcome::NoCurrentTask {
+                return Err(LockError::NotRunning);
             }
         }
     }

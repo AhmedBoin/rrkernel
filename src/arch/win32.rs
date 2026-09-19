@@ -418,11 +418,24 @@ unsafe extern "system" fn tick_thread_main(_param: Lpvoid) -> Dword {
 
         let next = scheduler::schedule_next();
         if next.is_null() {
-            // Nothing runnable: either the last task just finished, or no task
-            // has been spawned yet.
+            // Nothing runnable: either every remaining task is blocked, or the last task just
+            // finished. **Either way the task that was running must lose the CPU.** Returning
+            // without suspending it lets a task that just called `sleep` carry on executing its
+            // own code with `state == Blocked` — which is exactly the "sleep returned early"
+            // symptom, and not a subtle one: measured 591 724 of 591 839 sleeps returning at
+            // `elapsed == 0` before this branch did anything.
+            //
+            // The tick thread itself is the idle context here: it waits on the timer below and
+            // re-runs `schedule_next` on every tick, so a task whose deadline expires is resumed
+            // as soon as one does.
             let policy = (*KERNEL.config.get()).idle;
             if policy == IdlePolicy::ExitWhenAllDead {
                 finish_shutdown(0);
+            }
+            let prev_ptr = RUNNING_TCB.swap(0, Ordering::AcqRel);
+            if prev_ptr != 0 {
+                // `_next` is unused by the helper; there is no successor to resume.
+                suspend_and_maybe_close(prev_ptr as *mut TaskControlBlock, ptr::null_mut());
             }
             rearm_timer();
         } else {
@@ -691,4 +704,17 @@ pub fn shutdown(code: i32) -> ! {
             }
         }
     }
+}
+
+/// Whether a blocking call (`sleep`, `lock`, `park`) is guaranteed to have taken the caller off
+/// the CPU **before it returns**.
+///
+/// `true` on this portrue here: the tick thread suspends the task a moment later, so the task can return from its own blocking call and execute a few more instructions first.
+///
+/// This matters because a task measures its own sleep around the call: if the switch is
+/// asynchronous, the task can observe `elapsed == 0` and think it woke up early, even though
+/// the kernel booked the wait correctly. `examples/sleep_fidelity.rs` reports this property
+/// and gates its strict assertions on it.
+pub fn parks_synchronously() -> bool {
+    false
 }
