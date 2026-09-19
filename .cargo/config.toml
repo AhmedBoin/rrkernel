@@ -41,8 +41,17 @@ rustflags = [
 # ---------------------------------------------------------------------------
 # 3. QEMU runners (what `cargo run --target ...` uses)
 # ---------------------------------------------------------------------------
-# Every runner forwards the guest's exit status, so the demo's verdict becomes
-# the command's exit code and the whole thing can be used in CI.
+# Whether the guest's *exit status* reaches the caller depends on the guest, not on the runner:
+#
+#   * riscv32imac-unknown-none-elf ends the machine through QEMU's own exit, so the demo's
+#     verdict becomes the command's status. Verified: 0.
+#   * armv7a-none-eabi prints "VERDICT : PASS" and then never exits — it has no semihosting exit
+#     path, even though `-semihosting` is passed. Verified by waiting 60 s on a run that had
+#     already reported PASS.
+#
+# So CI reads the arm-a verdict from the output *and* wraps the run in `timeout`; a runner alone
+# would hang the job forever. (This comment used to claim every runner forwards the exit status.
+# That was true for one of the two.)
 
 [target.riscv32imac-unknown-none-elf]
 # `-bios none` is essential: it keeps QEMU from running OpenSBI first, so the

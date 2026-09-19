@@ -1,0 +1,132 @@
+# rrkernel CI — the four gates this project measures itself against.
+#
+# What is deliberately *not* here:
+#   * Xtensa (ESP32). It needs nightly plus the esp-rs toolchain fork for
+#     `asm_experimental_arch`, and Espressif's QEMU (upstream QEMU has no ESP32 machine). It is
+#     a build-only, locally-verified target (docs/ESP32.md); pretending otherwise in CI would be
+#     the sort of claim this file exists to prevent.
+#   * macOS. `src/arch/mod.rs` refuses to compile for it with a `compile_error!` and a pointer
+#     to docs/PORTING.md, because `sigaction`/`sigset_t`/`sigevent` layouts differ there.
+#   * Windows QEMU. The Windows job covers the win32 backend's host behaviour; the device
+#     verdicts come from the Linux QEMU job and from real hardware.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # A Linux runner *is* the POSIX backend, so this job covers the portable core and
+  # src/arch/posix.rs (timer_create/SIGALRM + hand-written x86-64 fibre switching) together.
+  posix-core:
+    name: host core + POSIX backend (tests, clippy, fmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --all-targets --features std -- -D warnings
+      - name: tests
+        run: cargo test --features std
+      - name: backend smoke + demo (bash scripts/run-linux.sh, without the long bench)
+        run: |
+          timeout 60 cargo run --quiet --example smoke --features std --release
+          timeout 120 cargo run --quiet --example roundrobin_demo --features std --release
+
+  windows:
+    name: host core + Win32 backend (tests, clippy)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # `.cargo/config.toml` pins the MSVC linker to one developer machine's LIBPATHs (the VS
+      # 2026 + SDK 10.0.28000.0 layout). Those paths do not exist on a runner, and this file is
+      # what keeps *this* machine building without a Developer prompt, so the CI job drops it
+      # instead of the repository carrying a fix that would break local builds. A portable
+      # version of that block is a known follow-up.
+      - name: drop the machine-specific cargo config
+        run: Remove-Item .cargo/config.toml
+      - name: clippy
+        run: cargo clippy --all-targets --features std -- -D warnings
+      - name: tests
+        run: cargo test --features std
+
+  bare-metal:
+    name: ${{ matrix.target }} (build dev + release, clippy)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - thumbv6m-none-eabi
+          - thumbv7m-none-eabi
+          - thumbv8m.main-none-eabihf
+          - riscv32imac-unknown-none-elf
+          - armv7a-none-eabi
+          - armv7r-none-eabi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+      # Both profiles, on purpose. `[profile.release] lto = "fat"` builds the library as
+      # bitcode, so a codegen error in an uncalled function can survive a release build — that
+      # is how an A/R-profile break hid for a while (see the `hard_fault` fix). The dev build is
+      # the one that assembles everything.
+      - name: build (dev — codegen actually happens here)
+        run: cargo build --target ${{ matrix.target }}
+      - name: build (release)
+        run: cargo build --target ${{ matrix.target }} --release
+      - name: clippy
+        run: cargo clippy --target ${{ matrix.target }} -- -D warnings
+
+  qemu:
+    name: QEMU verdicts (RISC-V 32, ARM A/R)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv32imac-unknown-none-elf,armv7a-none-eabi,thumbv7m-none-eabi
+      - name: install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm qemu-system-misc
+      - name: Cortex-M firmware links (the flagship target)
+        run: cargo build -p firmware-cortex-m --target thumbv7m-none-eabi --release
+      - name: RISC-V 32 — verdict *and* exit status
+        run: |
+          set -o pipefail
+          timeout 120 cargo run -p firmware-riscv --target riscv32imac-unknown-none-elf --release 2>&1 | tee riscv.out
+          echo "guest exit status: $?  (0 = the demo's verdict became the process status)"
+          grep -q 'VERDICT  : PASS' riscv.out
+      - name: ARM A/R — verdict only (this guest never exits)
+        run: |
+          set +e
+          timeout 60 cargo run -p firmware-arm-a --target armv7a-none-eabi --release > arma.out 2>&1
+          status=$?
+          cat arma.out
+          grep -q 'VERDICT  : PASS' arma.out || { echo "::error::ARM A/R produced no PASS verdict"; exit 1; }
+          if [ "$status" != "124" ]; then
+            echo "::warning::the ARM A/R guest exited by itself (status $status); docs and .cargo/config.toml say it does not"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qemu-output
+          path: |
+            riscv.out
+            arma.out
