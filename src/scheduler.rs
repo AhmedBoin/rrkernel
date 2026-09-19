@@ -447,7 +447,17 @@ pub unsafe fn schedule_next() -> *mut TaskControlBlock {
     }
 
     let next = if cur.is_null() {
-        *KERNEL.ring_head.get()
+        // No current task (the previous one finished and unlinked itself). Take the first
+        // *runnable* node from the head — **not** the head itself.
+        //
+        // Taking the head blindly is how a sleeping task came to resume early. `ring_head` is
+        // moved on every spawn, so a blocked task can be at the head; if it is, this branch used
+        // to hand it the CPU in the middle of its sleep. The symptom was the reported "about 1 in
+        // 15, right after a task is created or destroyed", because a task exit is exactly when
+        // this branch runs. Measured on an STM32F103: a 200-tick sleep in an otherwise idle ring
+        // returned after **6** ticks, reproduced with the cycle counter agreeing (so it was real
+        // time, not a counter artifact).
+        crate::ring::first_runnable_from(*KERNEL.ring_head.get())
     } else {
         ring::next_runnable(cur)
     };

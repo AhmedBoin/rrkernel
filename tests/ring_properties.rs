@@ -315,6 +315,40 @@ fn random_insert_unlink_state_sequences_keep_the_ring_consistent() {
 }
 
 #[test]
+fn first_runnable_from_skips_a_blocked_head() {
+    // The regression that mattered on hardware: when the kernel has no current task it asks for
+    // "the first runnable task in the ring", and taking the head blindly resumed a task that was
+    // in the middle of a sleep — because `ring_head` moves on every spawn, so a blocked task can
+    // be sitting there. Measured on an STM32F103: a 200-tick sleep came back after 6 ticks.
+    unsafe {
+        let a = Node::new(1); // becomes the head
+        let b = Node::new(2);
+        ring::insert_after(ptr::null_mut(), a.ptr());
+        ring::insert_after(a.ptr(), b.ptr());
+
+        // 1. Runnable head is its own answer (no rotation past it).
+        assert_eq!(ring::first_runnable_from(a.ptr()), a.ptr());
+
+        // 2. Blocked head with a runnable successor: the successor, never the blocked head.
+        (*a.ptr()).state = TaskState::Blocked;
+        assert_eq!(ring::first_runnable_from(a.ptr()), b.ptr());
+
+        // 3. Blocked head, blocked successor: nothing runnable, which is what sends the switch
+        //    path to its idle branch instead of running a sleeping task.
+        (*b.ptr()).state = TaskState::Blocked;
+        assert!(ring::first_runnable_from(a.ptr()).is_null());
+
+        // 4. Dead nodes are skipped the same way.
+        (*a.ptr()).state = TaskState::Dead;
+        (*b.ptr()).state = TaskState::Ready;
+        assert_eq!(ring::first_runnable_from(a.ptr()), b.ptr());
+
+        // 5. Null in, null out.
+        assert!(ring::first_runnable_from(ptr::null_mut()).is_null());
+    }
+}
+
+#[test]
 fn a_single_node_ring_is_its_own_successor_and_unlinks_to_nothing() {
     unsafe {
         let a = Node::new(1);

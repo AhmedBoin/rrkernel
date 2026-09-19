@@ -84,6 +84,25 @@ fn not_runnable(state: TaskState) -> bool {
     matches!(state, TaskState::Dead | TaskState::Blocked)
 }
 
+/// First runnable node **at or after** `from`, inclusive.
+///
+/// Unlike [`next_runnable`], which starts at the successor, this returns `from` itself when it is
+/// runnable. It exists for the case where the kernel has no current task (the previous one just
+/// unlinked itself) and wants "the first runnable task in the ring", not "the successor of the
+/// task that just left".
+///
+/// # Safety
+/// `from` must be null or a valid linked TCB pointer, called with preemption masked.
+pub unsafe fn first_runnable_from(from: *mut TaskControlBlock) -> *mut TaskControlBlock {
+    if from.is_null() || !not_runnable((*from).state) {
+        // Null stays null; a runnable node is its own answer.
+        return from;
+    }
+    // `from` is not runnable, so `next_runnable` cannot return it as a fallback: the result is
+    // the first runnable successor, or null when there is none.
+    next_runnable(from)
+}
+
 /// First runnable successor of `from`, skipping any node marked
 /// [`TaskState::Dead`] or [`TaskState::Blocked`]. Returns null when nothing is runnable
 /// (including the case where `from` itself is not runnable and is the only node).
