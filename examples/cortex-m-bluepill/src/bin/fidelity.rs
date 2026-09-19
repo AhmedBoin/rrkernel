@@ -163,10 +163,10 @@ fn main() {
         }
     );
 
-    report(idle_ticks, idle_cycles, expected);
+    report(idle_ticks, idle_cycles, expected, waits);
 }
 
-fn report(idle_ticks: u64, idle_cycles: u64, expected: u64) -> ! {
+fn report(idle_ticks: u64, idle_cycles: u64, expected: u64, idle_waits: u64) -> ! {
     let st = rrkernel::scheduler::stats();
     let sleeps = SLEEPS.load(Ordering::Relaxed);
     let early = EARLY.load(Ordering::Relaxed);
@@ -236,7 +236,7 @@ fn report(idle_ticks: u64, idle_cycles: u64, expected: u64) -> ! {
     // `CYCCNT` cannot be used for this on this part — it keeps advancing across a sleep that the
     // wait counter proves happened — but that same fact is what makes DWT usable as a time base.
     let permille = (idle_cycles.saturating_mul(1000) / expected.max(1)) as u32;
-    let waits_per_tick = waits / idle_ticks.max(1);
+    let waits_per_tick = idle_waits / idle_ticks.max(1);
     if waits_per_tick <= 2 {
         rprintln!(
             "verdict (2)     : idle path SLEEPS ({} wfi per tick): the pend clear works",

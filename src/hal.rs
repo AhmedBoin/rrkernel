@@ -45,7 +45,6 @@ impl KernelDelay {
     }
 }
 
-#[cfg(feature = "hal")]
 impl embedded_hal::delay::DelayNs for KernelDelay {
     fn delay_ns(&mut self, ns: u32) {
         let ns = ns as u64;
@@ -80,7 +79,6 @@ impl embedded_hal::delay::DelayNs for KernelDelay {
     }
 }
 
-#[cfg(all(feature = "hal-async", feature = "async"))]
 impl embedded_hal_async::delay::DelayNs for KernelDelay {
     async fn delay_ns(&mut self, ns: u32) {
         // Always the async path: an await hands the slice over, which is the entire point of using
@@ -109,7 +107,9 @@ impl<T> Blocking<T> {
     }
 }
 
-#[cfg(all(feature = "hal", target_has_atomic = "32"))]
+// Atomics are the one thing this module genuinely needs: the shared-bus device is built on
+// `sync::Mutex`, whose owner word is an atomic read-modify-write, so Cortex-M0/AVR do not get it.
+#[cfg(target_has_atomic = "32")]
 mod shared {
     use crate::sync::{LockError, LockId, Mutex, MutexGuard};
 
@@ -209,10 +209,9 @@ mod shared {
     // behaviour. See the I2C impl above for the pattern.
 }
 
-#[cfg(all(feature = "hal", target_has_atomic = "32"))]
+#[cfg(target_has_atomic = "32")]
 pub use shared::{MutexDevice, SharedError};
 
-#[cfg(all(feature = "hal", feature = "hal-async", feature = "async"))]
 mod facade {
     use super::Blocking;
     use crate::exec::block_on;

@@ -223,7 +223,6 @@ fn default_deadline() -> u64 {
     ))
 }
 
-#[cfg(feature = "io")]
 mod blocking_io {
     use super::*;
 
@@ -266,7 +265,6 @@ mod blocking_io {
     }
 }
 
-#[cfg(feature = "io-async")]
 mod async_io {
     use super::*;
 

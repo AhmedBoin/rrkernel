@@ -45,35 +45,25 @@ std = []
 # *host-only, build-time* dependencies: nothing extra reaches the target image, and
 # `default-features = false` leaves the kernel exactly as dependency-free as before.
 macros = ["dep:rrkernel-macros"]
-# `block_on`, the task `Waker`, `async fn sleep`, `spawn_async`. Pulls in **nothing**: it is
-# `core::future` on top of the event layer that is already in the kernel. The feature exists so the
-# default build stays as small as it is.
-async = []
-# `embedded-hal` adapters: delays, the blocking facade over an async driver, and a kernel-mutex
-# device for a shared bus.
-hal = ["dep:embedded-hal"]
-# `embedded-hal-async` adapters. Implies nothing on its own; `async` is separate so a blocking-only
-# application does not pay for the executor.
-hal-async = ["dep:embedded-hal-async"]
-# `embedded-io` byte streams on top of an ISR-driven `Signal` (blocking reads/writes).
-io = ["dep:embedded-io"]
-# `embedded-io-async` byte streams over the same `Signal`. Needs `async` for `block_on` and `io`
-# for the shared `ErrorType` impl.
-io-async = ["dep:embedded-io-async", "io", "async"]
 
 [dependencies]
 # See `macros` above. The proc-macro crate only ever runs in the compiler.
 rrkernel-macros = { path = "rrkernel-macros", optional = true }
 
-# --- Opt-in HAL/IO adapters ------------------------------------------------
-# The kernel itself is `core`-only and dependency-free (see the features above). These four are
-# what Phase 5 needs to expose the standard embedded traits, and they are pulled in **only** when
-# the corresponding feature is on, so `cargo build --target thumbv7m-none-eabi` still links
-# nothing but `core`.
-embedded-hal = { version = "1.0", optional = true }
-embedded-hal-async = { version = "1.0", optional = true }
-embedded-io = { version = "0.7", optional = true }
-embedded-io-async = { version = "0.7", optional = true }
+# --- The embedded ecosystem traits -----------------------------------------
+# `embedded-hal`, `embedded-hal-async`, `embedded-io` and `embedded-io-async` are **always**
+# available: there is no feature to enable before asking for a shared bus, an interrupt-driven
+# stream, an async delay or a blocking facade over an async driver. That is the whole point of
+# `hal`/`io` being part of the API rather than an add-on.
+#
+# The honest trade-off, stated here because it used to be a selling point: the *crate* is no longer
+# dependency-free. The **kernel core** still is - `core` only, no `alloc`, no libc - and these four
+# are `no_std` crates that compile for every supported target, so what they add is API surface and a
+# little flash, not a runtime like an OS or an allocator.
+embedded-hal = "1.0"
+embedded-hal-async = "1.0"
+embedded-io = "0.7"
+embedded-io-async = "0.7"
 
 # --- Profiles --------------------------------------------------------------
 # Timing-oriented release profile. NOTE: deliberately no `panic = "abort"` in
@@ -115,4 +105,4 @@ required-features = ["std"]
 [[example]]
 name = "io_layers"
 path = "examples/io_layers.rs"
-required-features = ["std", "async", "hal", "hal-async", "io"]
+required-features = ["std"]

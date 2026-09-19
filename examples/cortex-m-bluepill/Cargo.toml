@@ -7,11 +7,8 @@ license = "MIT"
 publish = false
 
 [dependencies]
-# The kernel. A path dependency like any other crate; it stays zero-dependency itself
-# (all of the ecosystem crates below belong to *this application*, not to the kernel).
-# `async` + `io` are on so that `src/bin/layers.rs` can exercise the async layer and the ISR-driven
-# pipe on the board; the other binaries here do not care.
-rrkernel = { path = "../..", features = ["async", "io"] }
+# The kernel. A path dependency like any other crate.
+rrkernel = { path = "../.." }
 
 # The normal Cortex-M stack, exactly as you would use on any other project. Note there is
 # no `panic-halt`: `rrkernel::app!` installs the panic handler.
