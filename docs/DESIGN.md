@@ -528,3 +528,107 @@ markers) then the *resume* lands in the wrong place. The evidence, the disproved
 window-chain theory and the corrected root cause (`rsil` and `s32c1i` are illegal while
 `PS.EXCM` is set, which every trap runs with) are in `docs/ESP32.md`; the atomic and
 critical-section fixes that came out of it are in the tree and apply to every target.
+
+## 8. Blocking, parking and the idle path
+
+*Added after the first hardware-verified Phase 1 run. Every number here was measured on an
+STM32F103C8 at 8 MHz with 1 ms slices (`examples/cortex-m-bluepill/src/bin/fidelity.rs`).*
+
+### 8.1 The blocking contract
+
+Every wait — `sleep`, `lock`, and the `park`/`Signal` layer built on the same primitive — goes
+through `scheduler::mark_blocked_locked`, whose whole reason for existing is that three things
+happen inside **one** critical section: the deadline is read and stored, the state becomes
+`Blocked`, and the switch is pended.
+
+Splitting them is how this kernel acquired two real bugs. `sleep_ticks` read the counter
+*before* entering the section, so a tick landing in the gap made the deadline one tick short.
+`sync::Mutex::lock` tested the lock and then blocked as two separate steps, so an `unlock` in
+between woke nobody and the waiter parked with no deadline at all: blocked forever on a free
+lock. Both are fixed, and both are now hard to reintroduce, because the section-taking wrappers
+(`block_until_tick`, `block_for_ticks`) are the only public entry points.
+
+A wait attempted with **no current task** (interrupt or idle context) no longer succeeds
+silently: it is counted in `stats().blocks_without_current` and asserted in debug builds.
+Returning quietly was the third way a sleep could "wake up early" — it had never blocked at all.
+The sleep path also re-checks its deadline in a loop, so a spurious wake costs another block
+instead of an early return.
+
+### 8.2 The blocked-head bug
+
+`schedule_next` took `KERNEL.ring_head` **blindly** whenever there was no current task — that is,
+right after any task exit — instead of asking for the first *runnable* task. `ring_head` moves on
+every spawn, so a `Blocked` task can be at the head, and it was then resumed in the middle of its
+sleep. That is the original defect: *"about 1 in 15 sleeps return early, most often right after a
+task is created or destroyed"*.
+
+| same firmware, same board | before | after |
+|---|---|---|
+| a 200-tick sleep in an otherwise idle ring | **6 ticks** | **200 ticks** |
+| `DWT->CYCCNT` across that window | 49 758 (6.2 ms of real time) | 1 595 243 = **997 ‰** of expected |
+
+The cycle counter agreeing with the tick counter is what makes it a proven early *wake* rather
+than a counter artifact. Fix: `ring::first_runnable_from`, plus a regression test covering
+blocked and dead heads.
+
+### 8.3 The idle path (fixed, and measured the honest way)
+
+The idle branch reaches `rrkernel_idle_wait` (Rust, called from the `PendSV` idle branch), which
+counts the wait, clears the `PendSV` request it has just serviced (`SCB->ICSR = PENDSVCLR`), and
+then executes `wfi`. Clearing is essential: the tick handler pends `PendSV` on **every** tick, and
+since this code is already inside `PendSV` that request can never be taken, so it stays latched —
+and `WFI` completes immediately whenever any exception is pending. That is the "PendSV spins at
+full speed" case the plan's Phase 3.2 predicted, and it was real.
+
+Measured on an STM32F103C8, 200-tick idle window: **`idle_waits` grew by exactly 200 = 1 per
+tick**, so the core parks once per tick and sleeps between ticks.
+
+**A methodology correction, recorded because it cost real time.** The first reading of this used
+`DWT->CYCCNT`, which advanced at 997 per mille across the window; that was taken as "the core is
+not gated, so the loop is spinning". It was wrong in both directions:
+
+* it reproduced identically with **no debugger attached** (flash + reset, run free, read the RTT
+  backlog later), so a SWD session was not keeping the clock alive; and
+* after the `PENDSVCLR` fix, with the wait counter proving one `wfi` per tick, `CYCCNT` *still*
+  advanced at 997 per mille.
+
+So on this part `CYCCNT` keeps counting while the core is genuinely asleep. The lesson is in the
+code: `KERNEL.idle_waits` exists because the cycle counter could not answer the question, and the
+"is it sleeping?" check must never be inferred from a counter that is not proven to stop.
+
+Consequence for Phase 2, now positively established: because `CYCCNT` continues across a
+*verified* sleep, DWT is a usable time base on this part (no timer peripheral needed), provided a
+64-bit extension folds its wrap.
+
+### 8.4 Asymmetric parking on the two `std` backends (open)
+
+A task that sleeps, blocks or yields is switched away immediately on **every bare-metal port**:
+the switch is taken on the way out of the blocking critical section. On the host backends it is
+not, and the port says so through `arch::parks_synchronously()`:
+
+* **Win32** — the tick thread performs the switch, so a blocking task keeps running until it is
+  suspended, which can be a whole slice later. Measured before the "nothing runnable → suspend
+  the previous task" fix: 591 724 of 591 839 sleeps returned at `elapsed == 0`.
+* **POSIX** — the `SIGALRM` handler has no idle context to switch to when nothing is runnable, so
+  it returns and the blocked fibre simply resumes. A scenario that keeps *every* task blocked
+  (which is exactly what a strict sleep test does) hangs there.
+
+In both cases the kernel's bookkeeping is right — the task is `Blocked`, skipped by
+`ring::next_runnable`, parked a moment later, `blocks_without_current` stays zero — but a task
+measuring its own sleep cannot see that. `examples/sleep_fidelity.rs` reports the property and
+runs its strict form only where the port can honour it. Fixes when wanted: an idle fibre for
+POSIX, a per-task park event for Windows.
+
+### 8.5 What a switch costs at the real clock
+
+`DWT`-measured at 8 MHz with spawn/exit churn on the ring:
+
+| metric | measured |
+|---|---|
+| switch, last / worst | **38 / 80 cycles** |
+| tick period error, worst | **2674 ns** (0.27 % of a 1 ms slice) |
+| early sleeps (601 sleeps, 1501 churn cycles) | **0** |
+| `ticks_deferred` / `blocks_without_current` | **0 / 0** |
+
+The 10×-switch-cost rule for `plan_timer` therefore implies a floor near **800 cycles**, not the
+100 in `arch::cortex_m::MIN_SLICE_CYCLES`.

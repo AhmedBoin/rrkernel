@@ -259,6 +259,13 @@ pub struct Kernel {
     /// the sleep returned immediately and looked like an early wake-up. A non-zero value here
     /// means a caller is blocking from a context that cannot block.
     pub blocks_without_current: UnsafeCell<u64>,
+    /// Times the switch path found nothing runnable and called the port's idle wait.
+    ///
+    /// This exists because "is the idle path sleeping or spinning?" could not be answered any
+    /// other way: on an STM32F103C8 `DWT->CYCCNT` advances at full rate across the idle window
+    /// even free-running (997 per mille), so the cycle counter cannot distinguish the two. Divide
+    /// by `ticks`: ~1 per tick means `wfi` is really sleeping, thousands means it is not.
+    pub idle_waits: UnsafeCell<u64>,
     /// Init-time configuration.
     pub config: UnsafeCell<KernelConfig>,
 }
@@ -289,6 +296,7 @@ impl Kernel {
             pending_free: UnsafeCell::new(ptr::null_mut()),
             reclaimed: UnsafeCell::new(0),
             blocks_without_current: UnsafeCell::new(0),
+            idle_waits: UnsafeCell::new(0),
             config: UnsafeCell::new(KernelConfig::default_const()),
         }
     }

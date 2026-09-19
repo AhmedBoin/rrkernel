@@ -218,6 +218,43 @@ unsafe extern "C" fn rrkernel_schedule_next() -> *mut TaskControlBlock {
     next
 }
 
+/// Idle wait: called from `PendSV` when the ring has nothing runnable, once per check.
+///
+/// Three things, in this order:
+///
+/// 1. **count the wait** — this is the only trustworthy way to tell a sleeping idle path from a
+///    spinning one on this part. `DWT->CYCCNT` advances at full rate across the idle window even
+///    free-running (measured 997 per mille on an STM32F103C8), so it cannot distinguish them. If
+///    this counter grows by ~1 per tick the core is sleeping; if it grows by millions per tick it
+///    is spinning.
+/// 2. **drop the switch request this loop has already serviced.** The tick handler pends `PendSV`
+///    on *every* tick, and since we are inside `PendSV` that request can never be taken, so it
+///    stays latched. `WFI` completes immediately while any exception is pending — that is what
+///    turns this branch into a busy loop, which is exactly what the plan's Phase 3.2 predicted.
+/// 3. **sleep** until an interrupt arrives (`SysTick`, a device IRQ, or a spawn's kick), then
+///    return so the asm can re-run the switch.
+///
+/// # Safety
+/// Called only from the `PendSV` idle branch, on the kernel stack.
+#[no_mangle]
+pub unsafe extern "C" fn rrkernel_idle_wait() {
+    *KERNEL.idle_waits.get() += 1;
+    // SCB->ICSR = PENDSVCLR: write 1 to clear the pending flag we have just serviced.
+    core::ptr::write_volatile(0xE000_ED04 as *mut u32, 0x0800_0000);
+    asm!("wfi", options(nomem, nostack, preserves_flags));
+}
+
+/// Number of times the switch path found nothing runnable and went to its idle wait.
+///
+/// Divide by `stats().ticks` to see whether the idle path is sleeping (~1 per tick) or spinning
+/// (thousands per tick).
+pub fn idle_waits() -> u64 {
+    let g = crate::critical::enter();
+    let n = unsafe { *KERNEL.idle_waits.get() };
+    drop(g);
+    n
+}
+
 /// `PendSV` handler: the entire context switch.
 ///
 /// Register discipline: `PendSV` is a naked handler with no prologue. It saves
@@ -325,10 +362,18 @@ pub unsafe extern "C" fn PendSV_Handler() {
         //    (a new task being spawned re-pends PendSV); re-check after each
         //    wake-up instead of spinning.
         "4:",
-        "wfi",
+        // Nothing runnable: hand the decision to Rust (`rrkernel_idle_wait`), which counts the
+        // wait, drops the switch request this loop has already serviced, and then sleeps.
+        //
+        // In Rust rather than inline in the asm body so that "is the idle path sleeping or
+        // spinning?" is answerable at all: on this part `DWT->CYCCNT` keeps advancing at full
+        // rate across the idle window even with no debugger attached (measured 997 per mille,
+        // free-running), so the cycle counter cannot tell the two apart. The counter can.
+        "bl    {idle}",
         "b     2b",
         kernel = sym KERNEL,
         sched = sym rrkernel_schedule_next,
+        idle = sym rrkernel_idle_wait,
         sp_off = const TCB_SP_OFFSET,
         flags_off = const crate::tcb::TCB_FLAGS_OFFSET,
         syst_cvr = const SYST_CVR,

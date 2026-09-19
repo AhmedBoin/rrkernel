@@ -8,8 +8,11 @@
 //! `examples/jitter_bench.rs`, which need a live kernel.
 //!
 //! NOTE: these tests build TCBs by hand (`Box`es), so they must not run while a
-//! scheduler instance is active in the same process — that is why the
-//! live-kernel tests live in `tests/kernel_lifecycle.rs` instead.
+//! scheduler instance is active in the same process. Live-kernel checks therefore live in
+//! `examples/` (`smoke`, `roundrobin_demo`, `sleep_fidelity`, and the bare-metal `fidelity`
+//! firmware), not in `#[test]`s: a live kernel owns the process (the host backends run a tick
+//! thread, and `scheduler::shutdown` *is* a process exit), so those checks report a verdict and
+//! an exit status instead of a test result.
 
 use rrkernel::arena::Arena;
 use rrkernel::ring;

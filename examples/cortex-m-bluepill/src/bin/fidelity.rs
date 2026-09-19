@@ -140,6 +140,7 @@ fn main() {
         rrkernel::scheduler::active_threads()
     );
 
+    let w0 = rrkernel::arch::idle_waits();
     let c0 = cycles();
     let t0 = rrkernel::now();
     rrkernel::sleep(Duration::from_millis(IDLE_WINDOW_MS));
@@ -148,6 +149,19 @@ fn main() {
     let idle_cycles = c1.wrapping_sub(c0) as u64;
     let idle_ticks = t1.wrapping_sub(t0);
     let expected = idle_ticks.saturating_mul(CORE_HZ as u64 / 1000);
+
+    // The trustworthy reading: how many times the idle loop actually waited, per tick.
+    let waits = rrkernel::arch::idle_waits().wrapping_sub(w0);
+    rprintln!(
+        "idle waits      : {} over {} ticks = {} per tick (1 = sleeping, thousands = spinning)",
+        waits,
+        idle_ticks,
+        if idle_ticks == 0 {
+            0
+        } else {
+            waits / idle_ticks
+        }
+    );
 
     report(idle_ticks, idle_cycles, expected);
 }
@@ -217,10 +231,27 @@ fn report(idle_ticks: u64, idle_cycles: u64, expected: u64) -> ! {
             (idle_cycles.saturating_mul(1000) / expected) as u32
         }
     );
-    if idle_cycles >= expected / 2 {
-        rprintln!("verdict (2)     : CYCCNT KEEPS COUNTING IN WFI -> usable as the time base");
+    // The trustworthy reading is `idle_waits`: one wait per tick means the core really parked
+    // (and the pend-clear took effect); thousands per tick would mean the idle loop is spinning.
+    // `CYCCNT` cannot be used for this on this part — it keeps advancing across a sleep that the
+    // wait counter proves happened — but that same fact is what makes DWT usable as a time base.
+    let permille = (idle_cycles.saturating_mul(1000) / expected.max(1)) as u32;
+    let waits_per_tick = waits / idle_ticks.max(1);
+    if waits_per_tick <= 2 {
+        rprintln!(
+            "verdict (2)     : idle path SLEEPS ({} wfi per tick): the pend clear works",
+            waits_per_tick
+        );
+        rprintln!(
+            "                  and CYCCNT advanced across that sleep ({} per mille), so",
+            permille
+        );
+        rprintln!("                  DWT is usable as the Phase 2 time base");
     } else {
-        rprintln!("verdict (2)     : CYCCNT STOPPED IN WFI -> a timer peripheral is required");
+        rprintln!(
+            "verdict (2)     : idle path SPINS ({} waits per tick): the pend clear did not take",
+            waits_per_tick
+        );
     }
     rprintln!("-----------------------------------------------------------");
 
