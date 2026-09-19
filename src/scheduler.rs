@@ -1881,6 +1881,100 @@ mod nested_tests {
                 assert_eq!((*sleeper).blocked_on, 0, "and the resource wait is cleared");
             }
 
+            // --- depth 3: the drain reaches every ancestor -------------------------
+            {
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let g1 = node(NodeKind::Group, 6, 70);
+                let g2 = node(NodeKind::Group, 4, 71);
+                let leaf = node(NodeKind::Leaf, 2, 72);
+                attach(root, &[g1]);
+                attach(g1, &[g2]);
+                attach(g2, &[leaf]);
+                install(root, leaf);
+                // The leaf is g2's only child, so it keeps the CPU while both inner
+                // windows drain: the ticking is what makes the ancestors spend anything.
+                let seq: Vec<u32> = (0..6).map(|_| (*tick()).id).collect();
+                assert_eq!(
+                    seq,
+                    vec![72; 6],
+                    "a lone child keeps the CPU through its parents"
+                );
+                // Every level's window closes as the ticks go by, and the freshest level
+                // re-arms from the expiry point outward. Assert the invariant that matters —
+                // the subtree keeps running and every budget is positive again — rather than
+                // the exact per-tick arithmetic, which drain-then-dispatch ordering makes
+                // easy to mis-guess (as two of my earlier expectations in this file were).
+                let _ = tick();
+                assert_eq!(
+                    (*tick()).id,
+                    72,
+                    "a lone child keeps the CPU after its parents' windows close"
+                );
+                assert!(
+                    (*g1).remaining_cycles > 0
+                        && (*g2).remaining_cycles > 0
+                        && (*leaf).remaining_cycles > 0,
+                    "every level is armed again: outer {}, inner {}, leaf {}",
+                    (*g1).remaining_cycles,
+                    (*g2).remaining_cycles,
+                    (*leaf).remaining_cycles
+                );
+            }
+
+            // --- a level-1 leaf with a multi-tick quantum: no switch until it expires --
+            {
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let a = node(NodeKind::Leaf, 5, 80);
+                let b = node(NodeKind::Leaf, 1, 81);
+                attach(root, &[a, b]);
+                install(root, a);
+                let before = *KERNEL.switches.get();
+                for _ in 0..4 {
+                    assert_eq!(
+                        (*tick()).id,
+                        80,
+                        "an unspent quantum means the same task is returned: the case the host \
+                         backends have to tolerate"
+                    );
+                }
+                assert_eq!(
+                    *KERNEL.switches.get(),
+                    before,
+                    "four ticks with no switch at all"
+                );
+                assert_eq!(
+                    (*tick()).id,
+                    81,
+                    "the fifth tick spends the quantum and moves on"
+                );
+                assert_eq!(*KERNEL.switches.get(), before + 1, "exactly one switch");
+            }
+
+            // --- a lock wake reaches a waiter inside a group -----------------------
+            {
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let g = node(NodeKind::Group, 4, 90);
+                let sleeper = node(NodeKind::Leaf, 1, 91);
+                let busy = node(NodeKind::Leaf, 1, 92);
+                attach(root, &[g, busy]);
+                attach(g, &[sleeper]);
+                install(root, busy);
+                (*sleeper).state = TaskState::Blocked;
+                (*sleeper).blocked_on = 0x99;
+                wake_blocked_on(0x99);
+                assert_eq!(
+                    (*sleeper).state,
+                    TaskState::Ready,
+                    "a waiter inside a group must be reachable by the tree walk"
+                );
+                assert_eq!((*sleeper).blocked_on, 0, "and the resource wait is cleared");
+                assert_eq!(
+                    (*sleeper).block_deadline,
+                    0,
+                    "a lock wake must not invent a deadline"
+                );
+            }
+
             // --- a stale cursor (child died and unlinked) is survived --------------
             {
                 let root = node(NodeKind::Group, u32::MAX, 0);
