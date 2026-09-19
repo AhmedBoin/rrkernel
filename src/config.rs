@@ -21,6 +21,15 @@ pub enum Slice {
     /// Raw hardware timer cycles (Cortex-M: `SysTick` reload value; must be
     /// in `1..=0x00FF_FFFF`). Ignored by time-based host backends.
     Cycles(u32),
+    /// **Per-task quantum only.** "Use whatever slice `configure()` set" — exactly the
+    /// semantics a plain [`crate::thread::spawn`] has always had. It is resolved against
+    /// the running configuration inside the spawn path, because it depends on a runtime
+    /// argument.
+    ///
+    /// It is deliberately not valid as the *configuration* slice: it resolves to zero
+    /// nanoseconds, which every port rejects as [`ConfigError::ZeroSlice`] rather than
+    /// silently programming something.
+    Default,
 }
 
 impl Slice {
@@ -45,6 +54,8 @@ impl Slice {
                     (c as u64).saturating_mul(1_000_000_000) / timer_hz as u64
                 }
             }
+            // Not a duration: resolved against the live configuration by the spawn path.
+            Slice::Default => 0,
         }
     }
 
@@ -56,6 +67,13 @@ impl Slice {
     /// Nanoseconds to timer cycles, rounded to *nearest* (a 1 ms request on a
     /// 168 MHz core gives exactly 168 000 cycles, not 167 999).
     pub const fn to_cycles(self, timer_hz: u32) -> u64 {
+        // `Default` has no cycles of its own: zero means "not a hardware slice", which is
+        // what makes `configure(.., Slice::Default, ..)` fail with `ZeroSlice` instead of
+        // programming a one-cycle slice. Checked before the "at least one cycle" clamp for
+        // exactly that reason.
+        if matches!(self, Slice::Default) {
+            return 0;
+        }
         if timer_hz == 0 {
             return 0;
         }
@@ -78,6 +96,7 @@ impl fmt::Display for Slice {
             Slice::Millis(n) => write!(f, "{} ms", n),
             Slice::Hertz(n) => write!(f, "{} Hz", n),
             Slice::Cycles(n) => write!(f, "{} cycles", n),
+            Slice::Default => write!(f, "the configured default"),
         }
     }
 }
@@ -207,6 +226,30 @@ pub enum ConfigError {
     NotInitialized,
     /// The platform refused an operation (thread/fiber creation, timer setup).
     Platform(&'static str),
+    /// A per-task quantum shorter than one tick. Nested scheduling runs every level off
+    /// the one hardware tick, so a quantum must be a whole number of ticks; this is
+    /// rejected rather than rounded, because silently changing a timing request is worse
+    /// than a startup error. Configure a shorter slice if you need finer granularity.
+    QuantumBelowTick {
+        /// The requested quantum, in nanoseconds.
+        requested_ns: u64,
+        /// The tick it must divide into, in nanoseconds.
+        tick_ns: u64,
+    },
+    /// A per-task quantum that is not a whole number of ticks (e.g. 2.5 ms on a 1 ms
+    /// tick). Legal slices are integer multiples of the configured slice, which is what
+    /// keeps every level's timing exact instead of accumulating rounding.
+    QuantumNotMultipleOfTick {
+        /// The requested quantum, in nanoseconds.
+        requested_ns: u64,
+        /// The tick it must be a multiple of, in nanoseconds.
+        tick_ns: u64,
+    },
+    /// A per-task quantum too large to be represented in ticks.
+    QuantumTooLarge {
+        /// The requested quantum, in ticks.
+        ticks: u64,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -239,6 +282,25 @@ impl fmt::Display for ConfigError {
             ConfigError::AlreadyInitialized => write!(f, "scheduler already initialized"),
             ConfigError::NotInitialized => write!(f, "scheduler not initialized"),
             ConfigError::Platform(msg) => write!(f, "platform error: {msg}"),
+            ConfigError::QuantumBelowTick {
+                requested_ns,
+                tick_ns,
+            } => write!(
+                f,
+                "requested quantum {requested_ns} ns is shorter than one tick ({tick_ns} ns): \
+                 configure a shorter slice, or use a quantum of at least one tick"
+            ),
+            ConfigError::QuantumNotMultipleOfTick {
+                requested_ns,
+                tick_ns,
+            } => write!(
+                f,
+                "requested quantum {requested_ns} ns is not a whole number of ticks ({tick_ns} ns): \
+                 nested quanta must be integer multiples of the configured slice"
+            ),
+            ConfigError::QuantumTooLarge { ticks } => {
+                write!(f, "requested quantum of {ticks} ticks is too large")
+            }
         }
     }
 }

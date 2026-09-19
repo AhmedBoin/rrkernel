@@ -6,7 +6,8 @@
 //! then the trampoline unlinks it. (`try_spawn` exists for callers who want
 //! allocation failure as a value instead of a panic.)
 
-use crate::config::ConfigError;
+use crate::config::{ConfigError, Slice};
+use crate::tcb::{TaskControlBlock, KERNEL};
 use core::fmt;
 
 /// Default per-task stack size when the caller does not specify one.
@@ -104,6 +105,102 @@ where
         stack_size
     };
     // SAFETY: `spawn_internal` takes the kernel critical section itself, so it
-    // is safe to call from any task or from `main`.
-    unsafe { crate::scheduler::spawn_internal(f, stack_size) }
+    // is safe to call from any task or from `main`. A plain spawn is a level-1 leaf with
+    // the configured slice, i.e. a quantum of one tick.
+    let root = unsafe { *KERNEL.root.get() };
+    unsafe { crate::scheduler::spawn_internal(root, 1, f, stack_size).map(|_| ()) }
+}
+
+// ---------------------------------------------------------------------------
+// Nested scheduling: the tree-aware API
+//
+// The simple path above is unchanged on purpose. Everything here is additive, and you
+// only need it if you want a task to have its own slice, or a group of tasks to share
+// one budget — see `docs/NESTED_SCHEDULING.md`.
+// ---------------------------------------------------------------------------
+
+/// Where a spawned node is attached in the scheduling tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Parent {
+    /// Level 1: a sibling of `main`. What [`spawn`] uses.
+    #[default]
+    Root,
+    /// A child of an existing [`GroupHandle`].
+    Group(GroupHandle),
+}
+
+/// An opaque handle to a live task. Valid for the life of the program: tasks are never
+/// freed while a handle could still be used, because a task leaves the tree only by
+/// finishing, and a finished task's handle is simply never a valid `Parent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskHandle(pub(crate) *mut TaskControlBlock);
+
+/// An opaque handle to a group node — a scheduling node with no stack and no code of its
+/// own, which owns a quantum and a ring of children.
+///
+/// **Groups live until shutdown.** There is deliberately no `close()`: without teardown
+/// there is no way to free a TCB that a cursor or a children-head still points at, which
+/// is the whole class of dangling-parent bug this design is otherwise exposed to. The
+/// cost is one TCB per group (no stack, no closure) held for the life of the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupHandle(pub(crate) *mut TaskControlBlock);
+
+// SAFETY: both handles are opaque pointers to kernel-owned nodes. The kernel serializes
+// every access to them under its critical section, so moving a handle between tasks (or
+// sending it to one) is safe. Using one is not unsafe — the API takes them by value and
+// re-validates the node it finds.
+unsafe impl Send for TaskHandle {}
+unsafe impl Send for GroupHandle {}
+
+/// Resolve a [`Parent`] to a kernel node, or fail if the kernel has no root yet.
+fn parent_node(parent: Parent) -> Result<*mut TaskControlBlock, SpawnError> {
+    let node = match parent {
+        Parent::Root => unsafe { *KERNEL.root.get() },
+        Parent::Group(g) => g.0,
+    };
+    if node.is_null() {
+        Err(SpawnError::NotInitialized)
+    } else {
+        Ok(node)
+    }
+}
+
+/// Spawn a task as a child of `parent`, running `slice` per turn — the tree-aware entry
+/// point. [`spawn`] is exactly this with `Parent::Root` and [`Slice::Default`].
+///
+/// The quantum is in *ticks*: `Slice::Default` means the configured slice, and any other
+/// value must be a whole number of ticks, i.e. an integer multiple of the slice passed to
+/// `configure()`. A shorter or non-multiple quantum is refused with a
+/// [`crate::config::ConfigError`] rather than rounded, because rounding would silently
+/// change the timing you asked for.
+///
+/// Nothing here constrains the relationship between a group's quantum and the total of
+/// its children's quanta: children may finish early (the group just repeats its lap until
+/// its own window closes) or run over (the group's window closes mid-child, and the next
+/// visit resumes exactly where it left off).
+pub fn spawn_in<F>(parent: Parent, slice: Slice, f: F) -> Result<TaskHandle, SpawnError>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let ticks = crate::scheduler::quantum_ticks_for(slice)?;
+    let stack_size = crate::scheduler::config().stack_size;
+    let node =
+        unsafe { crate::scheduler::spawn_internal(parent_node(parent)?, ticks, f, stack_size) }?;
+    Ok(TaskHandle(node))
+}
+
+/// Create a group node under `parent`, with its own quantum, and return a handle that
+/// further spawns can attach to (`Parent::Group(handle)`).
+///
+/// A group has **no stack, no closure and no backend thread or fiber** — it is a
+/// scheduling node, not a task, so it costs one TCB and nothing else. It may be created
+/// with no children and populated later, from any context, including from inside another
+/// task; a child spawned into it later joins the live ring immediately.
+///
+/// The quantum bounds one *visit* to the group's subtree. It does not constrain the sum
+/// of its children's quanta in either direction — see [`spawn_in`].
+pub fn spawn_group(parent: Parent, slice: Slice) -> Result<GroupHandle, SpawnError> {
+    let ticks = crate::scheduler::quantum_ticks_for(slice)?;
+    let g = unsafe { crate::scheduler::spawn_group_node(parent_node(parent)?, ticks) }?;
+    Ok(GroupHandle(g))
 }

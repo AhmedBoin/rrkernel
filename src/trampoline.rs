@@ -66,19 +66,28 @@ pub unsafe fn exit_task(tcb: *mut TaskControlBlock) -> ! {
     (*me).state = TaskState::Dead;
 
     let succ = ring::unlink(me);
-    *KERNEL.ring_head.get() = succ;
-    // If the task that left was a child of the root, move the root's entry point and
-    // cursor on, so neither is left pointing at an unlinked (and soon recycled) node.
-    // A node of a *nested* ring must touch neither: doing so would clobber the root's
-    // view with a pointer into some group's ring.
+    // Advance the parent's entry point and cursor past the node that just left, so neither
+    // is left pointing at an unlinked — and soon to be recycled — node. This is every
+    // level, not just the root: a group's cursor can be the child that just died, and a
+    // dangling cursor would either stall that subtree or, after reclaim, point into freed
+    // arena memory that the next spawn may hand to a different task.
+    //
+    // Nothing other than the dying node's *own* parent ring may be touched here.
+    let parent = (*me).parent;
+    if !parent.is_null() {
+        if (*parent).children_head == me {
+            (*parent).children_head = succ;
+        }
+        if (*parent).current_child == me {
+            (*parent).current_child = succ;
+        }
+    }
+    // `ring_head` describes the level-1 ring, so only a level-1 task may move it. A nested
+    // exit leaving it alone is what keeps the root's ring intact; before init (no root
+    // yet) the old unconditional behaviour is kept.
     let root = *KERNEL.root.get();
-    if !root.is_null() && (*me).parent == root {
-        if (*root).children_head == me {
-            (*root).children_head = succ;
-        }
-        if (*root).current_child == me {
-            (*root).current_child = succ;
-        }
+    if root.is_null() || parent == root {
+        *KERNEL.ring_head.get() = succ;
     }
     KERNEL.set_current(core::ptr::null_mut());
 

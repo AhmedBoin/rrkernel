@@ -149,8 +149,8 @@ pub fn init_with(cfg: SchedulerConfig) -> Result<(), ConfigError> {
         (*root).children_head = ptr::null_mut();
         (*root).current_child = ptr::null_mut();
         (*root).state = TaskState::Ready;
-        (*root).slice_cycles = plan.slice_cycles;
-        (*root).remaining_cycles = plan.slice_cycles;
+        (*root).slice_cycles = 1;
+        (*root).remaining_cycles = 1;
         *KERNEL.root.get() = root;
 
         // --- adopt the calling context as task 0 ---------------------------
@@ -162,8 +162,8 @@ pub fn init_with(cfg: SchedulerConfig) -> Result<(), ConfigError> {
         (*tcb).id = take_id();
         (*tcb).kind = crate::tcb::NodeKind::Leaf;
         (*tcb).parent = root;
-        (*tcb).slice_cycles = plan.slice_cycles;
-        (*tcb).remaining_cycles = plan.slice_cycles;
+        (*tcb).slice_cycles = 1;
+        (*tcb).remaining_cycles = 1;
         crate::arch::adopt_current_task(tcb)?;
         ring::insert_after(ptr::null_mut(), tcb);
         // Task 0 is the root's first child, so the root's ring and cursor start there.
@@ -455,6 +455,309 @@ pub fn main_body<F: FnOnce()>(f: F) -> ! {
 // Called by the ports
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Nested scheduling: the tree walk
+//
+// One rule covers every case:
+//
+//   **Each tick decrements the quantum of the running path — the current leaf and
+//   every ancestor. The OUTERMOST node on that path whose quantum reached zero
+//   decides what happens next: the turn passes to the next runnable child of that
+//   node's parent, or, if that node is the root, to the root's next runnable child.**
+//
+// Consequences, each a stated invariant:
+// * A group whose *own* quantum closed never touches its own cursor, so its next
+//   dispatch resumes at the child it was on instead of rewinding to the first.
+// * A leaf preempted because an ancestor's quantum closed keeps `remaining_cycles`,
+//   so it resumes with exactly the time it had left.
+// * A group dispatched fresh (quantum zero) is armed to a full quantum; one re-entered
+//   mid-visit keeps the rest of that visit.
+// * Children finishing early simply wrap their own ring and continue — underflow needs
+//   no special case, because the ancestor's quantum is still draining.
+// * A node with no runnable descendant bubbles the turn to its parent, and the root
+//   with nothing runnable is the existing idle path.
+//
+// Depth 1 stays bit-for-bit the old flat scheduler: every level-1 leaf has a quantum of
+// one tick and so does the root, so exactly one node is exhausted per tick and the
+// root's cursor advances, which is the flat rotation.
+// ---------------------------------------------------------------------------
+
+/// Depth cap for every tree walk. Deeper means the tree is malformed (a parent cycle),
+/// and stopping beats corrupting a ring or spinning forever.
+const MAX_TREE_DEPTH: u32 = 32;
+
+/// Debug-only shape check: a group must have no stack/closure, a leaf no children.
+#[inline]
+unsafe fn check_node_wellformed(node: *mut TaskControlBlock) {
+    debug_assert!(!node.is_null());
+    if (*node).kind == crate::tcb::NodeKind::Group {
+        debug_assert!(
+            (*node).sp.is_null() && (*node).stack_base.is_null() && (*node).closure_block.is_null(),
+            "rrkernel: a Group node must have no stack, sp or closure"
+        );
+    } else {
+        debug_assert!(
+            (*node).children_head.is_null() && (*node).current_child.is_null(),
+            "rrkernel: a Leaf node must have no children"
+        );
+    }
+}
+
+/// Arm `node`'s quantum if it is not already running one, and report what it has.
+///
+/// "Zero means not armed" is the distinction between a fresh dispatch (arm a full
+/// quantum) and a resumed one (keep exactly what was left), and the mid-slice-resume
+/// invariant rests on it.
+#[inline]
+unsafe fn arm_if_needed(node: *mut TaskControlBlock) -> u32 {
+    if (*node).remaining_cycles == 0 {
+        // `.max(1)`: a node whose quantum was never set still gets a turn rather than
+        // starving forever — a zero-tick quantum is a bug, not "never run".
+        (*node).remaining_cycles = (*node).slice_cycles.max(1);
+    }
+    (*node).remaining_cycles
+}
+
+/// Linked into a ring? `ring::unlink` poisons both links, so a node that has finished
+/// and left has `next == null`.
+#[inline]
+unsafe fn is_linked(node: *mut TaskControlBlock) -> bool {
+    !node.is_null() && !(*node).next.is_null()
+}
+
+#[inline]
+unsafe fn runnable(node: *mut TaskControlBlock) -> bool {
+    !node.is_null() && !matches!((*node).state, TaskState::Dead | TaskState::Blocked)
+}
+
+/// The child of `group` this visit should resume on, *without* advancing the cursor.
+///
+/// Robust against every state a cursor can be in: never set, pointing at a child that
+/// has since finished (whose links are poisoned, so `next_runnable` cannot be used on
+/// it), or pointing at a child that is merely blocked. Each case has a fallback, so a
+/// group cannot be wedged by a stale cursor.
+unsafe fn resume_child(group: *mut TaskControlBlock) -> *mut TaskControlBlock {
+    let head = (*group).children_head;
+    if head.is_null() {
+        return ptr::null_mut();
+    }
+    let cur = (*group).current_child;
+    if runnable(cur) && is_linked(cur) && (*cur).parent == group {
+        return cur;
+    }
+    if is_linked(cur) {
+        let n = crate::ring::next_runnable(cur);
+        if !n.is_null() {
+            return n;
+        }
+    }
+    crate::ring::first_runnable_from(head)
+}
+
+/// Descend through nested groups to an actual leaf, arming quanta on the way down.
+///
+/// Null means the subtree has nothing runnable — not an error, just "this group has
+/// nothing to offer this time", and the caller bubbles up.
+unsafe fn descend_and_arm(mut node: *mut TaskControlBlock) -> *mut TaskControlBlock {
+    let mut depth = 0u32;
+    while !node.is_null() && (*node).kind == crate::tcb::NodeKind::Group {
+        depth += 1;
+        if depth > MAX_TREE_DEPTH {
+            return ptr::null_mut();
+        }
+        check_node_wellformed(node);
+        arm_if_needed(node);
+        let child = resume_child(node);
+        if !runnable(child) {
+            return ptr::null_mut();
+        }
+        (*node).current_child = child;
+        node = child;
+    }
+    if !runnable(node) {
+        return ptr::null_mut();
+    }
+    check_node_wellformed(node);
+    arm_if_needed(node);
+    node
+}
+
+/// Hand the turn to the next runnable child of `group`, or bubble up to its parent.
+///
+/// This is the only place a cursor advances. It walks the child ring *once* looking for
+/// a child whose subtree can actually run, which is what lets "no runnable child here"
+/// be detected cheaply and without depending on `ring::next_runnable`'s wrap behaviour —
+/// and what keeps a malformed tree from spinning.
+unsafe fn advance_from(mut group: *mut TaskControlBlock) -> *mut TaskControlBlock {
+    let mut depth = 0u32;
+    loop {
+        depth += 1;
+        if group.is_null() || depth > MAX_TREE_DEPTH {
+            return ptr::null_mut();
+        }
+        check_node_wellformed(group);
+        let head = (*group).children_head;
+        if is_linked(head) {
+            // Start after the cursor when it is still one of ours, else at the head.
+            let cur = (*group).current_child;
+            let start = if is_linked(cur) && (*cur).parent == group && !(*cur).next.is_null() {
+                (*cur).next
+            } else {
+                head
+            };
+            let mut p = start;
+            loop {
+                if runnable(p) {
+                    let leaf = descend_and_arm(p);
+                    if !leaf.is_null() {
+                        (*group).current_child = p;
+                        return leaf;
+                    }
+                }
+                p = (*p).next;
+                if !is_linked(p) || p == start {
+                    break;
+                }
+            }
+        }
+        // Nothing runnable in this ring: this group's turn is over, ask its parent.
+        group = (*group).parent;
+    }
+}
+
+/// Choose the leaf to run next. `cur` is the current leaf, or null when the previous one
+/// finished and unlinked itself.
+///
+/// Returning `cur` unchanged means "no switch": the running leaf still has quantum left
+/// and no ancestor's closed. That can only happen for a quantum spanning more than one
+/// tick, which is impossible at depth 1 — which is exactly why depth 1 remains
+/// bit-for-bit the old flat scheduler.
+unsafe fn pick_next_leaf(cur: *mut TaskControlBlock) -> *mut TaskControlBlock {
+    let root = *KERNEL.root.get();
+    if root.is_null() {
+        // Not initialised, or a port reached the switch path before init: behave like the
+        // flat kernel and let the port's idle path decide.
+        return ptr::null_mut();
+    }
+
+    if cur.is_null() {
+        // No current task: enter the root's ring *at* its cursor, not after it. That
+        // mirrors the flat path's `first_runnable_from(ring_head)` — including the fix
+        // for the "sleep resumed early, about 1 in 15, right after a task was created or
+        // destroyed" bug, where taking the head blindly handed the CPU to a sleeping
+        // task. `first_runnable_from` is inclusive and `next_runnable` is not; getting
+        // that backwards reintroduces that bug.
+        let leaf = descend_and_arm(resume_child(root));
+        if !leaf.is_null() {
+            return leaf;
+        }
+        return advance_from(root);
+    }
+
+    let z = outermost_exhausted(cur);
+    if z.is_null() {
+        // Nothing on the path is out of quantum: the leaf keeps the CPU, so this tick
+        // ends without a switch.
+        return cur;
+    }
+    if z == root {
+        // The root's own quantum closed: the top-level rotation advances, which for a
+        // depth-1 tree is exactly `ring::next_runnable(current_leaf)`.
+        return advance_from(root);
+    }
+    // An inner node's quantum closed. The turn passes to that node's parent — which is
+    // what leaves the node's own cursor untouched, so its next dispatch resumes.
+    let parent = (*z).parent;
+    if parent.is_null() {
+        return advance_from(root);
+    }
+    advance_from(parent)
+}
+
+/// The outermost node on `node`'s path to the root whose quantum is exhausted, or null.
+///
+/// Outermost-wins is what lets an inner cursor survive: when a group's own quantum
+/// closes, the turn passes to *its parent's* next child and the group's cursor is left
+/// exactly where it was.
+unsafe fn outermost_exhausted(node: *mut TaskControlBlock) -> *mut TaskControlBlock {
+    let mut found: *mut TaskControlBlock = ptr::null_mut();
+    let mut p = node;
+    let mut depth = 0u32;
+    while !p.is_null() {
+        depth += 1;
+        if depth > MAX_TREE_DEPTH {
+            break;
+        }
+        if (*p).remaining_cycles == 0 {
+            found = p;
+        }
+        p = (*p).parent;
+    }
+    found
+}
+
+/// Spend one tick of quantum along the running path: the current leaf and every ancestor
+/// group, including the root.
+///
+/// Draining *ancestors* is what gives a group's visit a bounded length at all. Draining
+/// only the leaf — which is what the first draft of this design did — leaves every
+/// group's `remaining_cycles` frozen at its initial value, so the overflow case ("the
+/// group's window closes before all its children have had a turn") could never happen:
+/// the budget would simply never be spent.
+///
+/// Groups *not* on the current path are deliberately untouched: a group's quantum is
+/// spent only while its subtree is actually running, which is what keeps an idle group
+/// paused rather than burning its budget down while it has nothing to do.
+///
+/// Saturating and depth-bounded, so a malformed tree cannot spin here.
+unsafe fn drain_current_path() {
+    let mut n = KERNEL.current();
+    let mut depth = 0u32;
+    while !n.is_null() {
+        depth += 1;
+        if depth > MAX_TREE_DEPTH {
+            break;
+        }
+        (*n).remaining_cycles = (*n).remaining_cycles.saturating_sub(1);
+        n = (*n).parent;
+    }
+}
+
+/// Walk a node ring and, recursively, every child ring beneath it.
+///
+/// The tree equivalent of the old flat `p = (*p).next` sweep. It exists because a leaf
+/// blocked three levels down is not in the level-1 ring at all: a flat walk would never
+/// look at it, so neither its sleep nor its lock timeout would ever expire — silently,
+/// and only at depth. Recursion is bounded twice over: by the tree's depth cap and by
+/// the ring walk terminating on wrap.
+unsafe fn walk_tree<F: FnMut(*mut TaskControlBlock)>(first: *mut TaskControlBlock, f: &mut F) {
+    unsafe fn inner<F: FnMut(*mut TaskControlBlock)>(
+        first: *mut TaskControlBlock,
+        depth: u32,
+        f: &mut F,
+    ) {
+        if !is_linked(first) || depth > MAX_TREE_DEPTH {
+            return;
+        }
+        let start = first;
+        let mut p = first;
+        loop {
+            f(p);
+            if (*p).kind == crate::tcb::NodeKind::Group {
+                let head = (*p).children_head;
+                if is_linked(head) {
+                    inner(head, depth + 1, f);
+                }
+            }
+            p = (*p).next;
+            if !is_linked(p) || p == start {
+                break;
+            }
+        }
+    }
+    inner(first, 0, f);
+}
+
 /// Pick the next runnable task and hand it the CPU. **Runs in kernel context**
 /// (Cortex-M: inside PendSV, on the kernel/main stack; host: on the tick
 /// thread's stack), which is what makes it safe to reclaim the memory of the
@@ -473,21 +776,7 @@ pub unsafe fn schedule_next() -> *mut TaskControlBlock {
         KERNEL.set_current(ptr::null_mut());
     }
 
-    let next = if cur.is_null() {
-        // No current task (the previous one finished and unlinked itself). Take the first
-        // *runnable* node from the head — **not** the head itself.
-        //
-        // Taking the head blindly is how a sleeping task came to resume early. `ring_head` is
-        // moved on every spawn, so a blocked task can be at the head; if it is, this branch used
-        // to hand it the CPU in the middle of its sleep. The symptom was the reported "about 1 in
-        // 15, right after a task is created or destroyed", because a task exit is exactly when
-        // this branch runs. Measured on an STM32F103: a 200-tick sleep in an otherwise idle ring
-        // returned after **6** ticks, reproduced with the cycle counter agreeing (so it was real
-        // time, not a counter artifact).
-        crate::ring::first_runnable_from(*KERNEL.ring_head.get())
-    } else {
-        ring::next_runnable(cur)
-    };
+    let next = pick_next_leaf(cur);
 
     if next.is_null() || !(*next).is_linked() {
         // Nothing runnable at all: leave `current` alone, the port's idle path
@@ -512,6 +801,11 @@ pub unsafe fn schedule_next() -> *mut TaskControlBlock {
 #[inline]
 pub unsafe fn on_tick() {
     *KERNEL.ticks.get() += 1;
+    // Spend one tick of quantum along the running path — the current leaf and every
+    // ancestor group. This is the *only* place a quantum is spent, and the tick path is
+    // the only caller of `on_tick`, so quanta advance with the hardware timer and never
+    // with an immediate (non-tick) switch such as the one a spawn requests.
+    drain_current_path();
     // Wake anything whose bounded wait has expired. This is also what makes
     // `Mutex::try_lock_for` time out: the waiter is asleep on a deadline and the tick
     // is the only clock that can notice it passing.
@@ -669,10 +963,11 @@ pub fn wake_task(id: u32) {
     }
     let g = critical::enter();
     unsafe {
-        let head = *KERNEL.ring_head.get();
-        if !head.is_null() {
-            let mut p = head;
-            loop {
+        let root = *KERNEL.root.get();
+        if !root.is_null() {
+            // Tree walk: `wake_task` is the async `Waker`/`park` path, so a task nested
+            // inside a group must be reachable here or its wake-up is lost forever.
+            let mut wake = |p: *mut TaskControlBlock| {
                 if (*p).id == id {
                     (*p).flags |= crate::tcb::TCB_FLAG_WOKEN;
                     if (*p).state == TaskState::Blocked {
@@ -680,13 +975,9 @@ pub fn wake_task(id: u32) {
                         (*p).blocked_on = 0;
                         (*p).block_deadline = 0;
                     }
-                    break;
                 }
-                p = (*p).next;
-                if p.is_null() || p == head {
-                    break;
-                }
-            }
+            };
+            walk_tree((*root).children_head, &mut wake);
         }
     }
     drop(g);
@@ -786,46 +1077,40 @@ pub fn wake_first_blocked_on(resource: u32) -> bool {
     let g = critical::enter();
     let mut found = false;
     unsafe {
-        let head = *KERNEL.ring_head.get();
-        if !head.is_null() {
-            let mut p = head;
-            loop {
-                if (*p).state == TaskState::Blocked && (*p).blocked_on == resource {
+        let root = *KERNEL.root.get();
+        if !root.is_null() {
+            // Tree walk: a waiter nested inside a group must be found here, or the wake is
+            // lost. "First" is tree order rather than ring order, which is arbitrary either
+            // way — the contract is that one waiter is woken.
+            let mut wake = |p: *mut TaskControlBlock| {
+                if !found && (*p).state == TaskState::Blocked && (*p).blocked_on == resource {
                     (*p).flags |= crate::tcb::TCB_FLAG_WOKEN;
                     (*p).state = TaskState::Ready;
                     (*p).blocked_on = 0;
                     (*p).block_deadline = 0;
                     found = true;
-                    break;
                 }
-                p = (*p).next;
-                if p.is_null() || p == head {
-                    break;
-                }
-            }
+            };
+            walk_tree((*root).children_head, &mut wake);
         }
     }
     drop(g);
     found
 }
 
-/// How many tasks are blocked on `resource` right now. O(ring).
+/// How many tasks are blocked on `resource` right now. O(nodes in the tree).
 pub fn blocked_on_count(resource: u32) -> usize {
     let g = critical::enter();
     let mut n = 0usize;
     unsafe {
-        let head = *KERNEL.ring_head.get();
-        if !head.is_null() {
-            let mut p = head;
-            loop {
+        let root = *KERNEL.root.get();
+        if !root.is_null() {
+            let mut count = |p: *mut TaskControlBlock| {
                 if (*p).state == TaskState::Blocked && (*p).blocked_on == resource {
                     n += 1;
                 }
-                p = (*p).next;
-                if p.is_null() || p == head {
-                    break;
-                }
-            }
+            };
+            walk_tree((*root).children_head, &mut count);
         }
     }
     drop(g);
@@ -965,20 +1250,18 @@ pub fn sleep_until_tick(deadline_tick: u64) {
 pub fn wake_blocked_on(resource: u32) {
     let g = critical::enter();
     unsafe {
-        let head = *KERNEL.ring_head.get();
-        if !head.is_null() {
-            let mut p = head;
-            loop {
+        let root = *KERNEL.root.get();
+        if !root.is_null() {
+            // Tree walk, for the same reason as `wake_expired`: a waiter inside a group is
+            // not in the level-1 ring, and if it is not woken here it never is.
+            let mut waiter = |p: *mut TaskControlBlock| {
                 if (*p).state == TaskState::Blocked && (*p).blocked_on == resource {
                     (*p).state = TaskState::Ready;
                     (*p).blocked_on = 0;
                     (*p).block_deadline = 0;
                 }
-                p = (*p).next;
-                if p.is_null() || p == head {
-                    break;
-                }
-            }
+            };
+            walk_tree((*root).children_head, &mut waiter);
         }
     }
     drop(g);
@@ -990,12 +1273,15 @@ pub fn wake_blocked_on(resource: u32) {
 /// Called from the tick path, with preemption masked.
 unsafe fn wake_expired() {
     let now = *KERNEL.ticks.get();
-    let head = *KERNEL.ring_head.get();
-    if head.is_null() {
+    let root = *KERNEL.root.get();
+    if root.is_null() {
         return;
     }
-    let mut p = head;
-    loop {
+    // The whole tree, not just the level-1 ring. A leaf blocked at depth 2+ is in no
+    // level-1 ring, so the old flat walk never saw it: its sleep never expired and its
+    // lock timeout never fired. That is invisible at depth 1, which is why it has to be
+    // a tree walk before any group can exist.
+    let mut expired = |p: *mut TaskControlBlock| {
         if (*p).state == TaskState::Blocked
             && (*p).block_deadline != 0
             && now >= (*p).block_deadline
@@ -1004,11 +1290,8 @@ unsafe fn wake_expired() {
             (*p).blocked_on = 0;
             (*p).block_deadline = 0;
         }
-        p = (*p).next;
-        if p.is_null() || p == head {
-            break;
-        }
-    }
+    };
+    walk_tree((*root).children_head, &mut expired);
 }
 
 /// Times a blocking wait was attempted with no current task (interrupt or idle context).
@@ -1074,6 +1357,120 @@ pub fn active_cores() -> usize {
     let n = unsafe { (*KERNEL.config.get()).active_cores };
     drop(g);
     n
+}
+
+use crate::SpawnError;
+
+/// Link `node` into `parent`'s child ring, right after the parent's cursor, so a
+/// newcomer runs as soon as its group's turn comes round rather than a lap later.
+///
+/// Handles the empty-ring case (self-linked) and both unset-parent pointers. The global
+/// `ring_head` describes the level-1 ring only, so only a level-1 insert moves it.
+///
+/// # Safety
+/// Caller holds a critical section. `node` must not already be linked.
+unsafe fn insert_child(parent: *mut TaskControlBlock, node: *mut TaskControlBlock) {
+    debug_assert!(!parent.is_null(), "spawn with no parent node");
+    debug_assert!(
+        (*parent).kind == crate::tcb::NodeKind::Group,
+        "rrkernel: only a Group can own a child ring"
+    );
+    let anchor = {
+        let cur = (*parent).current_child;
+        if is_linked(cur) && (*cur).parent == parent {
+            cur
+        } else {
+            (*parent).children_head
+        }
+    };
+    if is_linked(anchor) {
+        crate::ring::insert_after(anchor, node);
+    } else {
+        // First child: a self-linked ring of one.
+        crate::ring::insert_after(ptr::null_mut(), node);
+    }
+    if (*parent).children_head.is_null() {
+        (*parent).children_head = node;
+    }
+    if (*parent).current_child.is_null() {
+        // A fresh group's cursor starts at its first child, so it is not treated as
+        // "never dispatched" forever after.
+        (*parent).current_child = node;
+    }
+    let root = *KERNEL.root.get();
+    if parent == root {
+        *KERNEL.ring_head.get() = node;
+    }
+    debug_assert!(crate::ring::check((*parent).children_head).is_ok());
+}
+
+/// Create a group node: a scheduling node with **no stack, no closure and no backend
+/// resources**. It owns a quantum and a child ring, nothing else.
+///
+/// Deliberately does *not* call `crate::arch::create_task`: a group never runs, so it
+/// must not consume a stack (on bare metal, the largest cost in the arena) nor a thread
+/// or fiber on the OS-backed ports.
+///
+/// # Safety
+/// Caller holds a critical section.
+pub(crate) unsafe fn spawn_group_node(
+    parent: *mut TaskControlBlock,
+    quantum_ticks: u32,
+) -> Result<*mut TaskControlBlock, SpawnError> {
+    if !(*arena()).is_ready() {
+        return Err(SpawnError::NotInitialized);
+    }
+    if parent.is_null() {
+        return Err(SpawnError::NotInitialized);
+    }
+    let tcb = alloc_tcb().ok_or(SpawnError::ArenaExhausted)?;
+    (*tcb).id = take_id();
+    (*tcb).state = TaskState::Ready;
+    (*tcb).kind = crate::tcb::NodeKind::Group;
+    (*tcb).parent = parent;
+    (*tcb).children_head = ptr::null_mut();
+    (*tcb).current_child = ptr::null_mut();
+    (*tcb).slice_cycles = quantum_ticks.max(1);
+    (*tcb).remaining_cycles = quantum_ticks.max(1);
+    insert_child(parent, tcb);
+    Ok(tcb)
+}
+
+/// Convert a requested per-task quantum into ticks, rejecting anything that is not a
+/// whole number of hardware ticks.
+///
+/// Every level of the tree runs off the single hardware tick, so a quantum has to be an
+/// integer multiple of it. Rounding would silently change a timing request — the same
+/// reason `configure()` refuses a slice the platform cannot honour instead of clamping —
+/// so this is an error, with the numbers in it.
+pub(crate) fn quantum_ticks_for(slice: Slice) -> Result<u32, SpawnError> {
+    if matches!(slice, Slice::Default) {
+        // Today's semantics: whatever `configure()` set, i.e. one tick.
+        return Ok(1);
+    }
+    let cfg = crate::scheduler::config();
+    let tick_ns = crate::arch::cycles_to_ns(cfg.slice_cycles);
+    if tick_ns == 0 {
+        return Err(SpawnError::NotInitialized);
+    }
+    let requested_ns = slice.as_nanos(cfg.timer_hz);
+    if requested_ns == 0 || requested_ns < tick_ns {
+        return Err(SpawnError::Backend(ConfigError::QuantumBelowTick {
+            requested_ns,
+            tick_ns,
+        }));
+    }
+    if !requested_ns.is_multiple_of(tick_ns) {
+        return Err(SpawnError::Backend(ConfigError::QuantumNotMultipleOfTick {
+            requested_ns,
+            tick_ns,
+        }));
+    }
+    let ticks = requested_ns / tick_ns;
+    if ticks > u32::MAX as u64 {
+        return Err(SpawnError::Backend(ConfigError::QuantumTooLarge { ticks }));
+    }
+    Ok(ticks as u32)
 }
 
 /// Allocate and zero a TCB from the kernel arena. Caller holds a critical
@@ -1166,7 +1563,17 @@ pub(crate) unsafe fn push_pending_free(tcb: *mut TaskControlBlock) {
 }
 
 /// Bodies of `thread::spawn*`. Takes the critical section itself.
-pub(crate) unsafe fn spawn_internal<F>(f: F, stack_size: usize) -> Result<(), crate::SpawnError>
+///
+/// `parent` is the node the newcomer joins — the implicit root for a plain
+/// `thread::spawn` — and `quantum_ticks` is its quantum in root-slice ticks (`1` is the
+/// configured slice, which is what every plain-spawned task has always had). Returns the
+/// new node so the tree-aware API can hand back a handle.
+pub(crate) unsafe fn spawn_internal<F>(
+    parent: *mut TaskControlBlock,
+    quantum_ticks: u32,
+    f: F,
+    stack_size: usize,
+) -> Result<*mut TaskControlBlock, crate::SpawnError>
 where
     F: FnOnce() + Send + 'static,
 {
@@ -1205,12 +1612,13 @@ where
     (*tcb).state = TaskState::Ready;
     (*tcb).slices_run = 0;
     (*tcb).switches = 0;
-    // A spawned task is a leaf under the root (level 1), running the configured
-    // slice — the same quantum every plain-spawned task has always had.
+    // A spawned leaf joins the given parent, with the given quantum in root-slice ticks.
+    // For a plain `thread::spawn` that parent is the root and the quantum is 1 — one
+    // hardware tick — which is exactly what every level-1 task has always had.
     (*tcb).kind = crate::tcb::NodeKind::Leaf;
-    (*tcb).parent = *KERNEL.root.get();
-    (*tcb).slice_cycles = (*KERNEL.config.get()).slice_cycles;
-    (*tcb).remaining_cycles = (*KERNEL.config.get()).slice_cycles;
+    (*tcb).parent = parent;
+    (*tcb).slice_cycles = quantum_ticks.max(1);
+    (*tcb).remaining_cycles = quantum_ticks.max(1);
 
     // 3. Backend-specific: stack, initial register frame, thread/fiber.
     if let Err(e) = crate::arch::create_task(tcb, stack_size) {
@@ -1221,22 +1629,10 @@ where
         return Err(e);
     }
 
-    // 4. Link into the live ring, *after* the current task: the newcomer runs
-    //    immediately next, instead of waiting a whole lap.
-    let cur = KERNEL.current();
-    crate::ring::insert_after(cur, tcb);
-    if cur.is_null() {
-        (*tcb).state = TaskState::Running;
-        KERNEL.set_current(tcb);
-    }
-    *KERNEL.ring_head.get() = tcb;
-    // Keep the root's view of the level-1 ring in step with `ring_head`. Either node
-    // is a valid entry point for a circular ring, so only filling the empty case is
-    // needed; task 0 already set it when the root had a ring.
-    let root = *KERNEL.root.get();
-    if !root.is_null() && (*root).children_head.is_null() {
-        (*root).children_head = tcb;
-    }
+    // 4. Link into the parent's child ring, right after its cursor: the newcomer runs as
+    //    soon as that ring's turn comes round, instead of waiting a whole lap. For a
+    //    level-1 spawn this is the flat ring, so the old behaviour is preserved exactly.
+    insert_child(parent, tcb);
     *KERNEL.total_threads.get() += 1;
     *KERNEL.active_threads.get() += 1;
 
@@ -1252,5 +1648,5 @@ where
         // reset.
     }
     drop(g);
-    Ok(())
+    Ok(tcb)
 }

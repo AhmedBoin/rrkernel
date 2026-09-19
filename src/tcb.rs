@@ -109,9 +109,14 @@ pub struct TaskControlBlock {
 
     /// Monotonic task id (1 = `main`/task 0), handy for logs.
     pub id: u32,
-    /// Per-task slice budget in timer cycles. Reserved: today every task uses
-    /// `KERNEL.slice_cycles`, but keeping the field here means a future
-    /// per-task quantum needs no ABI change.
+    /// This node's quantum: for a `Leaf`, how many ticks of CPU it gets per turn; for a
+    /// `Group`, how many ticks one visit to its subtree may last.
+    ///
+    /// **In root-slice ticks**, not timer cycles — `KERNEL.config.slice_cycles` is the
+    /// same interval in timer units. `1` therefore means "one hardware slice", which is
+    /// what every level-1 task has always had, so a depth-1 tree behaves exactly as the
+    /// flat ring did. Tick-based quanta also survive a runtime `set_slice` retune
+    /// unchanged, where absolute timer cycles would silently become wrong.
     pub slice_cycles: u32,
     /// How many slices this task has been given (observability).
     pub slices_run: u32,
@@ -154,9 +159,14 @@ pub struct TaskControlBlock {
     /// unchanged**: a group preempted because its own quantum closed resumes at the
     /// child it was on, never at its first child. Null for a `Leaf`.
     pub current_child: *mut TaskControlBlock,
-    /// Ticks left in this node's current quantum — for a `Leaf` the rest of its
-    /// slice, for a `Group` the rest of this visit's budget. Zero means "not armed":
-    /// a fresh dispatch arms a full quantum, a resume keeps what was left.
+    /// Ticks left in this node's current quantum — for a `Leaf` the rest of its turn on
+    /// the CPU, for a `Group` the rest of this visit's budget. Zero means "not armed": a
+    /// fresh dispatch arms a full quantum, a resume keeps what was left, which is what
+    /// makes a leaf preempted mid-slice resume with exactly the time it had.
+    ///
+    /// Spent by the tick path (`scheduler::on_tick`), which decrements it for the running
+    /// leaf *and every ancestor group* — one per hardware tick, and never on an immediate
+    /// switch such as the one a spawn requests.
     pub remaining_cycles: u32,
 }
 
