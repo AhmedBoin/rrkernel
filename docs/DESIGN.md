@@ -531,7 +531,7 @@ critical-section fixes that came out of it are in the tree and apply to every ta
 
 ## 8. Blocking, parking and the idle path
 
-*Added after the first hardware-verified Phase 1 run. Every number here was measured on an
+*Added after the first hardware-verified run. Every number here was measured on an
 STM32F103C8 at 8 MHz with 1 ms slices (`examples/cortex-m-bluepill/src/bin/fidelity.rs`).*
 
 ### 8.1 The blocking contract
@@ -578,7 +578,7 @@ counts the wait, clears the `PendSV` request it has just serviced (`SCB->ICSR = 
 then executes `wfi`. Clearing is essential: the tick handler pends `PendSV` on **every** tick, and
 since this code is already inside `PendSV` that request can never be taken, so it stays latched —
 and `WFI` completes immediately whenever any exception is pending. That is the "PendSV spins at
-full speed" case the plan's Phase 3.2 predicted, and it was real.
+full speed" case predicted in this document before the board was attached, and it was real.
 
 Measured on an STM32F103C8, 200-tick idle window: **`idle_waits` grew by exactly 200 = 1 per
 tick**, so the core parks once per tick and sleeps between ticks.
@@ -596,7 +596,7 @@ So on this part `CYCCNT` keeps counting while the core is genuinely asleep. The 
 code: `KERNEL.idle_waits` exists because the cycle counter could not answer the question, and the
 "is it sleeping?" check must never be inferred from a counter that is not proven to stop.
 
-Consequence for Phase 2, now positively established: because `CYCCNT` continues across a
+Consequence for the time base, now positively established: because `CYCCNT` continues across a
 *verified* sleep, DWT is a usable time base on this part (no timer peripheral needed), provided a
 64-bit extension folds its wrap.
 

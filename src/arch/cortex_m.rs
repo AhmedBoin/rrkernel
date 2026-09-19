@@ -230,7 +230,7 @@ unsafe extern "C" fn rrkernel_schedule_next() -> *mut TaskControlBlock {
 /// 2. **drop the switch request this loop has already serviced.** The tick handler pends `PendSV`
 ///    on *every* tick, and since we are inside `PendSV` that request can never be taken, so it
 ///    stays latched. `WFI` completes immediately while any exception is pending — that is what
-///    turns this branch into a busy loop, which is exactly what the plan's Phase 3.2 predicted.
+///    turns this branch into a busy loop, which is exactly what `idle_waits` is there to detect.
 /// 3. **sleep** until an interrupt arrives (`SysTick`, a device IRQ, or a spawn's kick), then
 ///    return so the asm can re-run the switch.
 ///

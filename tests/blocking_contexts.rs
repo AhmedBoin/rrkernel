@@ -1,4 +1,4 @@
-//! Blocking from the wrong context: the deterministic half of the Phase 1 fix.
+//! Blocking from the wrong context: the deterministic half of the sleep fix.
 //!
 //! `scheduler::block_current` used to `return` silently when there was no current task. That is
 //! the *cheapest* way for a sleep to "wake up early": it never blocked at all, so the deadline
@@ -10,7 +10,7 @@
 //! nothing else here can be driving the scheduler: `KERNEL.current()` is null for a reason, and
 //! the assertion under test is the real one rather than a simulated one.
 //!
-//! The live-kernel half of Phase 1 (sleeps under spawn/exit churn, all-sleeping windows) is
+//! The live-kernel half (sleeps under spawn/exit churn, all-sleeping windows) is
 //! `examples/sleep_fidelity.rs`: a live kernel owns the process (the host backend runs a tick
 //! thread, and `scheduler::shutdown` *is* a process exit), which is why the repository reports
 //! that kind of check as an example with a verdict instead of a `#[test]`.

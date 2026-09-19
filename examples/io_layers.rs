@@ -1,4 +1,4 @@
-//! The three claims Phase 5 makes about I/O, measured rather than asserted.
+//! Three claims about I/O, measured rather than asserted.
 //!
 //! ```text
 //! cargo run --example io_layers --features std,async,hal,hal-async,io,io-async

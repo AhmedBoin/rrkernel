@@ -913,7 +913,8 @@ pub fn sleep_ticks(ticks: u64) {
 ///
 /// What this **cannot** fix: a clock that jumps forward. A double-counted tick moves `now()`
 /// past the deadline and the loop exits immediately — that is a time-base fault, not a wake-up
-/// fault, and it is why the deadline clock moves off the slice counter in the next phase.
+/// fault, and it is why a deadline clock belongs on a counter of its own rather than the slice
+/// count.
 pub fn sleep_until_tick(deadline_tick: u64) {
     while tick_count() < deadline_tick {
         match block_until_tick(0, deadline_tick) {

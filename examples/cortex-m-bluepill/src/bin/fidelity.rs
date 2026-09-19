@@ -1,4 +1,4 @@
-//! Metal acceptance for Phase 1 and the measurement Phase 2 depends on.
+//! Metal acceptance for sleeps, and the measurement the time base depends on.
 //!
 //! ```text
 //! cd examples/cortex-m-bluepill
@@ -246,7 +246,7 @@ fn report(idle_ticks: u64, idle_cycles: u64, expected: u64, idle_waits: u64) -> 
             "                  and CYCCNT advanced across that sleep ({} per mille), so",
             permille
         );
-        rprintln!("                  DWT is usable as the Phase 2 time base");
+        rprintln!("                  DWT is usable as the time base");
     } else {
         rprintln!(
             "verdict (2)     : idle path SPINS ({} waits per tick): the pend clear did not take",

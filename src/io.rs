@@ -1,6 +1,6 @@
 //! `embedded-io` byte streams driven by an interrupt, without burning a slice while idle.
 //!
-//! This is the layer the plan calls "ISR-driven blocking read": a peripheral's interrupt handler
+//! This is the ISR-driven blocking read layer: a peripheral's interrupt handler
 //! pushes bytes into a [`Pipe`], and a task that reads from it **parks** instead of polling. The task
 //! is off the CPU between bytes, the round robin continues, and every read has a deadline.
 //!

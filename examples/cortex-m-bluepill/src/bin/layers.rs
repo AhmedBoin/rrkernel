@@ -1,4 +1,4 @@
-//! The Phase 3/4/5 layers on the board: park/wake, async sleeps, the ISR-driven pipe.
+//! The upper layers on the board: park/wake, async sleeps, the ISR-driven pipe.
 //!
 //! ```text
 //! cd examples/cortex-m-bluepill

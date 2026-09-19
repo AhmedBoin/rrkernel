@@ -4,14 +4,14 @@
 //! cargo run --example sleep_fidelity --features std --release
 //! ```
 //!
-//! This is the acceptance test for Phase 1, and it exists because of a specific report: on an
+//! This is the acceptance test for sleeps, and it exists because of a specific report: on an
 //! STM32F103 a `sleep` occasionally returned *early* — about one call in fifteen, most often
 //! right after a task was created or destroyed. Three distinct causes were identified, and this
 //! example is aimed at all three:
 //!
 //! 1. **a tick counted twice**, when a switch restarts the slice while the timer's exception is
 //!    already latched (metal-only; not reproducible on a host backend, and the reason `now()`
-//!    moves to an independent counter in the next phase);
+//!    belongs on a counter of its own rather than the slice count);
 //! 2. **a deadline computed from a stale tick read** — `sleep_ticks` read the counter *outside*
 //!    the critical section that did the blocking, so a tick landing in between made the deadline
 //!    one tick short. Fixed by construction: the deadline is now read inside that section;
