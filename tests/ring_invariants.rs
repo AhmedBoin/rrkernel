@@ -46,6 +46,11 @@ impl Node {
             block_deadline: 0,
             held_locks: [0; rrkernel::sync::MAX_HELD_LOCKS],
             held_count: 0,
+            kind: rrkernel::tcb::NodeKind::Leaf,
+            parent: std::ptr::null_mut(),
+            children_head: std::ptr::null_mut(),
+            current_child: std::ptr::null_mut(),
+            remaining_cycles: 0,
         });
         // Give it a non-null stack-pointer value so a bug that dereferences
         // `sp` is more likely to be caught.

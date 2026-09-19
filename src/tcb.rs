@@ -15,6 +15,24 @@ use core::ptr;
 /// those where the lock layer is compiled out for lack of atomics) can size the array.
 pub const MAX_HELD_LOCKS: usize = 4;
 
+/// What a scheduling node is: a real task, or a virtual group of tasks.
+///
+/// The scheduler walks a **tree** whose nodes are all [`TaskControlBlock`]s. A depth-1
+/// tree (the implicit root plus only `Leaf` children) is mechanically identical to the
+/// flat ring this kernel had before groups existed — which is why adding groups changes
+/// no existing behaviour: `Leaf` is the default, and it is what every TCB zeroed by
+/// `alloc_tcb` already is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NodeKind {
+    /// A real task: own stack, saved `sp`, a closure to run.
+    Leaf = 0,
+    /// A virtual node with **no stack and no code of its own**. It owns a quantum
+    /// (`slice_cycles`) that bounds one *visit* to its subtree, plus its own ring of
+    /// children. Dispatching a group means descending *through* it, never switching to it.
+    Group = 1,
+}
+
 /// Task lifecycle state.
 ///
 /// `Blocked` is the state a task enters when it is waiting for a resource (a [`Mutex`]
@@ -118,6 +136,28 @@ pub struct TaskControlBlock {
     pub held_locks: [u32; MAX_HELD_LOCKS],
     /// How many entries of `held_locks` are in use.
     pub held_count: u8,
+
+    // -----------------------------------------------------------------------
+    // Nested scheduling. Appended deliberately: `sp` must stay at offset 0 and no
+    // existing field may move, because the ports read `sp`/`state`/`flags` at fixed
+    // offsets and `current_tcb` sits at offset 0 of `KERNEL`.
+    // -----------------------------------------------------------------------
+    /// A real task, or a virtual group that schedules its own children.
+    pub kind: NodeKind,
+    /// The ring this node is a member of. Null only for the implicit root, which is
+    /// in no ring — it *owns* the level-1 ring.
+    pub parent: *mut TaskControlBlock,
+    /// Head of this node's child ring. Null for a `Leaf`, and null for a `Group` with
+    /// no children yet (legal: children may be spawned into it later).
+    pub children_head: *mut TaskControlBlock,
+    /// This group's round-robin cursor. **The field that must survive a visit
+    /// unchanged**: a group preempted because its own quantum closed resumes at the
+    /// child it was on, never at its first child. Null for a `Leaf`.
+    pub current_child: *mut TaskControlBlock,
+    /// Ticks left in this node's current quantum — for a `Leaf` the rest of its
+    /// slice, for a `Group` the rest of this visit's budget. Zero means "not armed":
+    /// a fresh dispatch arms a full quantum, a resume keeps what was left.
+    pub remaining_cycles: u32,
 }
 
 /// Byte offset of `sp` inside [`TaskControlBlock`]. Load-bearing for assembly.
@@ -277,6 +317,15 @@ pub struct Kernel {
     pub idle_waits: UnsafeCell<u64>,
     /// Init-time configuration.
     pub config: UnsafeCell<KernelConfig>,
+    /// The implicit root of the scheduling tree: a `Group` with no parent that owns
+    /// the level-1 ring. Null before init.
+    ///
+    /// It is not a task — no stack, no closure — and is therefore not counted in
+    /// `total_threads`/`active_threads`, which count leaves. Its quantum is the
+    /// configured slice, and that is exactly what keeps the flat case identical to
+    /// the old flat ring: with only leaves under the root, the root's quantum and a
+    /// level-1 leaf's quantum are the same number of ticks.
+    pub root: UnsafeCell<*mut TaskControlBlock>,
 }
 
 // SAFETY: all mutation is funneled through `critical` sections and the raw
@@ -307,6 +356,7 @@ impl Kernel {
             blocks_without_current: UnsafeCell::new(0),
             idle_waits: UnsafeCell::new(0),
             config: UnsafeCell::new(KernelConfig::default_const()),
+            root: UnsafeCell::new(ptr::null_mut()),
         }
     }
 

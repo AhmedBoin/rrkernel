@@ -133,6 +133,26 @@ pub fn init_with(cfg: SchedulerConfig) -> Result<(), ConfigError> {
             active_cores: (*KERNEL.config.get()).active_cores.max(1),
         };
 
+        // --- the implicit root group ---------------------------------------
+        // The scheduling tree's root: a Group with no parent, owning the level-1
+        // ring. Not a task (no stack, no closure) and deliberately not counted in
+        // `total_threads`/`active_threads`, which count *leaves* — the tasks the user
+        // actually asked for. Its quantum is the configured slice; that equality with
+        // a level-1 leaf's quantum is what makes the flat case behave exactly as the
+        // flat ring always has.
+        let root = alloc_tcb().ok_or(ConfigError::ArenaTooSmall {
+            provided: len,
+            minimum: min_arena,
+        })?;
+        (*root).kind = crate::tcb::NodeKind::Group;
+        (*root).parent = ptr::null_mut();
+        (*root).children_head = ptr::null_mut();
+        (*root).current_child = ptr::null_mut();
+        (*root).state = TaskState::Ready;
+        (*root).slice_cycles = plan.slice_cycles;
+        (*root).remaining_cycles = plan.slice_cycles;
+        *KERNEL.root.get() = root;
+
         // --- adopt the calling context as task 0 ---------------------------
         let tcb = alloc_tcb().ok_or(ConfigError::ArenaTooSmall {
             provided: len,
@@ -140,8 +160,15 @@ pub fn init_with(cfg: SchedulerConfig) -> Result<(), ConfigError> {
         })?;
         (*tcb).state = TaskState::Running;
         (*tcb).id = take_id();
+        (*tcb).kind = crate::tcb::NodeKind::Leaf;
+        (*tcb).parent = root;
+        (*tcb).slice_cycles = plan.slice_cycles;
+        (*tcb).remaining_cycles = plan.slice_cycles;
         crate::arch::adopt_current_task(tcb)?;
         ring::insert_after(ptr::null_mut(), tcb);
+        // Task 0 is the root's first child, so the root's ring and cursor start there.
+        (*root).children_head = tcb;
+        (*root).current_child = tcb;
         KERNEL.set_current(tcb);
         *KERNEL.ring_head.get() = tcb;
         *KERNEL.total_threads.get() = 1;
@@ -1178,6 +1205,12 @@ where
     (*tcb).state = TaskState::Ready;
     (*tcb).slices_run = 0;
     (*tcb).switches = 0;
+    // A spawned task is a leaf under the root (level 1), running the configured
+    // slice — the same quantum every plain-spawned task has always had.
+    (*tcb).kind = crate::tcb::NodeKind::Leaf;
+    (*tcb).parent = *KERNEL.root.get();
+    (*tcb).slice_cycles = (*KERNEL.config.get()).slice_cycles;
+    (*tcb).remaining_cycles = (*KERNEL.config.get()).slice_cycles;
 
     // 3. Backend-specific: stack, initial register frame, thread/fiber.
     if let Err(e) = crate::arch::create_task(tcb, stack_size) {
@@ -1197,6 +1230,13 @@ where
         KERNEL.set_current(tcb);
     }
     *KERNEL.ring_head.get() = tcb;
+    // Keep the root's view of the level-1 ring in step with `ring_head`. Either node
+    // is a valid entry point for a circular ring, so only filling the empty case is
+    // needed; task 0 already set it when the root had a ring.
+    let root = *KERNEL.root.get();
+    if !root.is_null() && (*root).children_head.is_null() {
+        (*root).children_head = tcb;
+    }
     *KERNEL.total_threads.get() += 1;
     *KERNEL.active_threads.get() += 1;
 

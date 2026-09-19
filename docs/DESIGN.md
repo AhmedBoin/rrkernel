@@ -29,17 +29,32 @@ pub struct TaskControlBlock {
     pub stack_base: *mut u8,
     pub stack_size: usize,
     pub closure_block: *mut u8,  // the task body: [header | FnOnce], arena-allocated
-    pub state: TaskState,        // Ready | Running | Dead
+    pub state: TaskState,        // Ready | Running | Dead | Blocked
     pub flags: u8,               // bit 0: context lives on MSP (Cortex-M task 0)
     pub next: *mut TaskControlBlock,
     pub prev: *mut TaskControlBlock,
     pub id: u32,
-    pub slice_cycles: u32,       // reserved: per-task quantum without an ABI break
+    pub slice_cycles: u32,       // this node's quantum: a leaf's slice, a group's visit
     pub slices_run: u32,
     pub switches: u32,
     pub backend: *mut u8,        // Win32 thread handle, ... (unused on cortex-m)
+    pub blocked_on: u32,
+    pub block_deadline: u64,
+    pub held_locks: [u32; MAX_HELD_LOCKS],
+    pub held_count: u8,
+    // --- nested scheduling (appended, so no existing offset moves) ---
+    pub kind: NodeKind,             // Leaf (a task) | Group (a virtual node)
+    pub parent: *mut TaskControlBlock,      // null only for the implicit root
+    pub children_head: *mut TaskControlBlock,
+    pub current_child: *mut TaskControlBlock,   // the cursor that survives a visit
+    pub remaining_cycles: u32,      // ticks left in this node's current quantum
 }
 ```
+
+Every field above `kind` predates nested scheduling and keeps its offset, which is the
+whole reason the new fields are appended: `sp` is at offset 0, `flags` and `state` sit at
+offsets the assembly reads literally, and `current_tcb` is at offset 0 of `KERNEL`. The
+`const` assertions and the offsets test in `tests/ring_invariants.rs` cover exactly those.
 
 `sp` at offset 0 and `flags`'s offset are `const`-asserted in the library and
 cross-checked by a test, because the Cortex-M assembly reads both with literal

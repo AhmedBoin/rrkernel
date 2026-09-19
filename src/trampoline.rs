@@ -67,6 +67,19 @@ pub unsafe fn exit_task(tcb: *mut TaskControlBlock) -> ! {
 
     let succ = ring::unlink(me);
     *KERNEL.ring_head.get() = succ;
+    // If the task that left was a child of the root, move the root's entry point and
+    // cursor on, so neither is left pointing at an unlinked (and soon recycled) node.
+    // A node of a *nested* ring must touch neither: doing so would clobber the root's
+    // view with a pointer into some group's ring.
+    let root = *KERNEL.root.get();
+    if !root.is_null() && (*me).parent == root {
+        if (*root).children_head == me {
+            (*root).children_head = succ;
+        }
+        if (*root).current_child == me {
+            (*root).current_child = succ;
+        }
+    }
     KERNEL.set_current(core::ptr::null_mut());
 
     let active = KERNEL.active_threads.get();
