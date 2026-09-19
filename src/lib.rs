@@ -136,7 +136,10 @@ pub use smp::CpuArch;
 #[cfg(target_has_atomic = "32")]
 pub use sync::{LockError, LockId, Mutex, MutexGuard};
 pub use tcb::{IdlePolicy, KernelConfig, Measure, TaskControlBlock, TaskState};
-pub use thread::{spawn, spawn_with_stack, try_spawn, SpawnError, DEFAULT_STACK_SIZE};
+pub use thread::{
+    spawn, spawn_group, spawn_in, spawn_with_stack, try_spawn, GroupHandle, Parent, SpawnError,
+    TaskHandle, DEFAULT_STACK_SIZE,
+};
 
 /// The global kernel control block (ring, counters, tick statistics).
 pub use tcb::KERNEL;
