@@ -243,6 +243,10 @@ build matters: `lto = "fat"` defers codegen, and a release-only build once hid a
   stay `0` from init in the `io_layers` scenario, which stalls deadline-based paths (timeouts, async
   timers). The blocking-I/O paths are unaffected, and the metal port ticks normally (3254 ticks
   measured). `examples/io_layers.rs` exits 3 with that diagnosis instead of hanging.
+  Reproduced from a **published** consumer (a fresh project, `cargo add rrkernel --features std`, a
+  2 ms slice, three tasks): the first `sleep` returns immediately and `stats().ticks` reads `0` while
+  a task's own `now()` had already reached `10` — the two readings disagree, which is a sharper clue
+  than the stall itself. Metal is unaffected: the board measures 3254 ticks and 0 early sleeps.
 - **Asymmetric parking on the host backends.** On every bare-metal port a blocking call has taken the
   caller off the CPU before it returns. On Win32 the tick thread parks the task a moment later; on
   POSIX the `SIGALRM` handler has no idle context to switch to when nothing is runnable. Each port
