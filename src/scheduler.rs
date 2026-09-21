@@ -484,14 +484,27 @@ pub fn main_body<F: FnOnce()>(f: F) -> ! {
 // * A node with no runnable descendant bubbles the turn to its parent, and the root
 //   with nothing runnable is the existing idle path.
 //
-// Depth 1 stays bit-for-bit the old flat scheduler: every level-1 leaf has a quantum of
-// one tick and so does the root, so exactly one node is exhausted per tick and the
-// root's cursor advances, which is the flat rotation.
+// Depth 1 stays bit-for-bit the old flat scheduler: every level-1 leaf has a quantum of one
+// tick while the root's quantum is unbounded, so it is the *leaf* that expires and advances
+// the root's cursor — exactly one node per tick, which is the flat rotation.
 // ---------------------------------------------------------------------------
 
-/// Depth cap for every tree walk. Deeper means the tree is malformed (a parent cycle),
-/// and stopping beats corrupting a ring or spinning forever.
-const MAX_TREE_DEPTH: u32 = 32;
+/// Step limit for every tree walk, derived from the number of TCBs the kernel has handed out.
+///
+/// There is deliberately **no fixed nesting limit**: a tree may be as deep as the arena
+/// allows, one TCB per group. An earlier revision capped depth at 32 and stopped descending
+/// past it — silently, which turned a legal tree into an unreachable subtree whose tasks
+/// never ran again (the exact starvation this design has to rule out). A walk cannot
+/// legitimately take more steps than the tree has nodes, so this both permits deep trees and
+/// terminates on a malformed one (a parent cycle, which only a bug elsewhere could create).
+///
+/// Read without a critical section on purpose: the counter is monotonic, so a stale value is
+/// merely a smaller bound, and every caller is already in kernel context.
+#[inline]
+fn walk_limit() -> u32 {
+    // `+2`: one for the node being walked, one for the step that detects a wrap.
+    unsafe { *crate::tcb::KERNEL.nodes.get() }.saturating_add(2)
+}
 
 /// Debug-only shape check: a group must have no stack/closure, a leaf no children.
 #[inline]
@@ -567,9 +580,10 @@ unsafe fn resume_child(group: *mut TaskControlBlock) -> *mut TaskControlBlock {
 /// nothing to offer this time", and the caller bubbles up.
 unsafe fn descend_and_arm(mut node: *mut TaskControlBlock) -> *mut TaskControlBlock {
     let mut depth = 0u32;
+    let limit = walk_limit();
     while !node.is_null() && (*node).kind == crate::tcb::NodeKind::Group {
         depth += 1;
-        if depth > MAX_TREE_DEPTH {
+        if depth > limit {
             return ptr::null_mut();
         }
         check_node_wellformed(node);
@@ -597,9 +611,10 @@ unsafe fn descend_and_arm(mut node: *mut TaskControlBlock) -> *mut TaskControlBl
 /// and what keeps a malformed tree from spinning.
 unsafe fn advance_from(mut group: *mut TaskControlBlock) -> *mut TaskControlBlock {
     let mut depth = 0u32;
+    let limit = walk_limit();
     loop {
         depth += 1;
-        if group.is_null() || depth > MAX_TREE_DEPTH {
+        if group.is_null() || depth > limit {
             return ptr::null_mut();
         }
         check_node_wellformed(group);
@@ -690,9 +705,10 @@ unsafe fn outermost_exhausted(node: *mut TaskControlBlock) -> *mut TaskControlBl
     let mut found: *mut TaskControlBlock = ptr::null_mut();
     let mut p = node;
     let mut depth = 0u32;
+    let limit = walk_limit();
     while !p.is_null() {
         depth += 1;
-        if depth > MAX_TREE_DEPTH {
+        if depth > limit {
             break;
         }
         if (*p).remaining_cycles == 0 {
@@ -720,9 +736,10 @@ unsafe fn outermost_exhausted(node: *mut TaskControlBlock) -> *mut TaskControlBl
 unsafe fn drain_current_path() {
     let mut n = KERNEL.current();
     let mut depth = 0u32;
+    let limit = walk_limit();
     while !n.is_null() {
         depth += 1;
-        if depth > MAX_TREE_DEPTH {
+        if depth > limit {
             break;
         }
         (*n).remaining_cycles = (*n).remaining_cycles.saturating_sub(1);
@@ -734,35 +751,56 @@ unsafe fn drain_current_path() {
 ///
 /// The tree equivalent of the old flat `p = (*p).next` sweep. It exists because a leaf
 /// blocked three levels down is not in the level-1 ring at all: a flat walk would never
-/// look at it, so neither its sleep nor its lock timeout would ever expire — silently,
-/// and only at depth. Recursion is bounded twice over: by the tree's depth cap and by
-/// the ring walk terminating on wrap.
+/// look at it, so neither its sleep nor its lock timeout would ever expire — silently, and
+/// only at depth.
+///
+/// **Iterative, not recursive.** It used to call itself once per level, which made kernel
+/// stack use grow with nesting depth — fine at depth 3, an overflow on a 2 KiB MSP at depth
+/// 40. The parent pointers the tree already carries make an explicit stack unnecessary:
+/// descend to the children head, then move sideways to the next sibling or up to the parent,
+/// and stop on the shared step budget rather than at a fixed depth.
 unsafe fn walk_tree<F: FnMut(*mut TaskControlBlock)>(first: *mut TaskControlBlock, f: &mut F) {
-    unsafe fn inner<F: FnMut(*mut TaskControlBlock)>(
-        first: *mut TaskControlBlock,
-        depth: u32,
-        f: &mut F,
-    ) {
-        if !is_linked(first) || depth > MAX_TREE_DEPTH {
-            return;
+    if !is_linked(first) {
+        return;
+    }
+    // The ring's owner: the walk covers this ring and everything beneath it, and stops when
+    // it ascends back to the owner. The owner itself is never visited — it was already seen
+    // on the way *into* the ring, and for a level-1 walk it is the root.
+    let owner = (*first).parent;
+    let limit = walk_limit();
+    let mut steps = 0u32;
+    let mut p = first;
+    loop {
+        steps += 1;
+        if steps > limit {
+            return; // malformed tree (a cycle): stop rather than spin
         }
-        let start = first;
-        let mut p = first;
+        f(p);
+        // Depth-first: into this node's children when it has any.
+        if (*p).kind == crate::tcb::NodeKind::Group && is_linked((*p).children_head) {
+            p = (*p).children_head;
+            continue;
+        }
+        // Otherwise sideways to the next sibling, or up. Both loops count against the one
+        // step budget, so even a parent cycle terminates.
         loop {
-            f(p);
-            if (*p).kind == crate::tcb::NodeKind::Group {
-                let head = (*p).children_head;
-                if is_linked(head) {
-                    inner(head, depth + 1, f);
-                }
+            steps += 1;
+            if steps > limit {
+                return;
             }
-            p = (*p).next;
-            if !is_linked(p) || p == start {
+            let parent = (*p).parent;
+            if parent.is_null() || parent == owner {
+                return;
+            }
+            let entry = (*parent).children_head;
+            let next = (*p).next;
+            if is_linked(next) && next != entry {
+                p = next;
                 break;
             }
+            p = parent;
         }
     }
-    inner(first, 0, f);
 }
 
 /// Pick the next runnable task and hand it the CPU. **Runs in kernel context**
@@ -1488,6 +1526,8 @@ pub(crate) unsafe fn alloc_tcb() -> Option<*mut TaskControlBlock> {
         core::mem::align_of::<TaskControlBlock>(),
     )? as *mut TaskControlBlock;
     ptr::write_bytes(p as *mut u8, 0, core::mem::size_of::<TaskControlBlock>());
+    // One more node for the tree walks to account for; see `walk_limit`.
+    *KERNEL.nodes.get() += 1;
     Some(p)
 }
 
@@ -1684,6 +1724,9 @@ mod nested_tests {
         (*p).id = id;
         (*p).slice_cycles = quantum;
         (*p).remaining_cycles = quantum;
+        // Mirror `alloc_tcb`: this is what the walk budget is derived from, so a test tree
+        // that skipped it would exercise a budget of two nodes and quietly prove nothing.
+        *KERNEL.nodes.get() += 1;
         p
     }
 
@@ -1997,6 +2040,112 @@ mod nested_tests {
                     "a cursor pointing at a dead, unlinked child must not wedge the group"
                 );
                 assert_eq!((*g).current_child, live, "and the cursor is repaired");
+            }
+
+            // --- deep nesting: bounded by memory, not by a constant -----------------
+            {
+                // 64 nested groups with one leaf at the bottom. The fixed depth cap this
+                // replaces returned null past 32, *silently*, which turned a legal tree into
+                // an unreachable subtree whose tasks never ran again. That is the starvation
+                // this design has to rule out, so it gets a test rather than a comment.
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let mut deep = root;
+                for i in 0..64u32 {
+                    let g = node(NodeKind::Group, 3, 400 + i);
+                    attach(deep, &[g]);
+                    deep = g;
+                }
+                let leaf = node(NodeKind::Leaf, 2, 399);
+                attach(deep, &[leaf]);
+                install(root, leaf);
+                let who = tick();
+                assert_eq!(
+                    (*who).id,
+                    399,
+                    "a leaf 65 levels down must still be reached and run"
+                );
+            }
+
+            // --- no leaf starves, and no run outlasts its quantum -------------------
+            {
+                // A mixed tree: a level-1 leaf, a group with two leaves and a nested group
+                // holding two more. This is the headline promise of nested scheduling --
+                // every runnable task gets time -- and the run-length half of it is what
+                // "inside a slot, time is continuous" means from a leaf point of view.
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let a = node(NodeKind::Leaf, 2, 500);
+                let g1 = node(NodeKind::Group, 5, 501);
+                let b = node(NodeKind::Leaf, 2, 502);
+                let c = node(NodeKind::Leaf, 3, 503);
+                let g2 = node(NodeKind::Group, 4, 504);
+                let d = node(NodeKind::Leaf, 2, 505);
+                let e = node(NodeKind::Leaf, 1, 506);
+                attach(root, &[a, g1]);
+                attach(g1, &[b, c, g2]);
+                attach(g2, &[d, e]);
+                install(root, a);
+
+                let ids = [500u32, 502, 503, 505, 506];
+                let quanta = [2u32, 2, 3, 2, 1];
+                let mut served = [0u32; 5];
+                let mut last = 0u32;
+                let mut run = 0u32;
+                for _ in 0..200 {
+                    let id = (*tick()).id;
+                    let i = ids
+                        .iter()
+                        .position(|x| *x == id)
+                        .expect("every tick must return a leaf of this tree");
+                    served[i] += 1;
+                    if id == last {
+                        run += 1;
+                    } else {
+                        if last != 0 {
+                            let prev = ids.iter().position(|x| *x == last).unwrap();
+                            assert!(
+                                run <= quanta[prev],
+                                "leaf {} ran {run} ticks, longer than its quantum {}",
+                                last,
+                                quanta[prev]
+                            );
+                        }
+                        last = id;
+                        run = 1;
+                    }
+                }
+                for i in 0..5 {
+                    assert!(
+                        served[i] != 0,
+                        "leaf {} never ran: a nested group starved it",
+                        ids[i]
+                    );
+                }
+                assert_eq!(
+                    served.iter().sum::<u32>(),
+                    200,
+                    "no tick was wasted, and none went outside the tree"
+                );
+            }
+
+            // --- a malformed tree terminates instead of spinning --------------------
+            {
+                // No application can build this with the public API (a parent is only ever
+                // set at spawn, and the result is a tree), so it stands in for a future bug
+                // elsewhere. It matters *now* because the walks are bounded by the node count
+                // rather than by a depth constant: that bound is the only reason the fixed cap
+                // could be removed at all, so it is the thing to test.
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let x = node(NodeKind::Group, 4, 600);
+                let y = node(NodeKind::Leaf, 1, 601);
+                attach(root, &[x]);
+                attach(x, &[y]);
+                (*x).parent = y; // a cycle: the group parent is its own child
+                install(root, y);
+                drain_current_path();
+                let _ = outermost_exhausted(y);
+                let mut visited = 0u32;
+                walk_tree((*root).children_head, &mut |_| visited += 1);
+                assert!(visited != 0, "the walk visited something before giving up");
             }
         }
     }

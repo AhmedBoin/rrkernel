@@ -146,3 +146,79 @@ the private dispatch functions, so they belong as in-crate unit tests in `schedu
 example that runs a nested tree on the host, and verification of the host backends when
 `schedule_next` legitimately returns the current task (which happens only once a quantum
 longer than one tick exists).
+
+---
+
+## Verification log
+
+### Depth is bounded by memory, not by a constant
+
+The first implementation capped every tree walk at `MAX_TREE_DEPTH = 32`, and past that cap
+`descend_and_arm` returned null. The effect was not a clean refusal: the subtree below the cap
+became **unreachable**, so its tasks silently stopped running. That is the "a thread starves"
+failure this design exists to rule out, so the cap is gone.
+
+What replaces it:
+
+* `KERNEL.nodes` counts the TCBs handed out since init -- a monotonic upper bound on the number
+  of scheduling nodes in the tree. Every walk takes that many steps, plus two. A walk cannot
+  legitimately take more steps than the tree has nodes, so deep trees are legal and a malformed
+  one (a parent cycle) still terminates.
+* `walk_tree` is now **iterative**. It used to call itself once per level, which made kernel
+  stack use grow with nesting depth: fine at depth 3, an overflow on a 2 KiB MSP at depth 40.
+  The parent pointers the tree already carries make an explicit stack unnecessary.
+
+Nesting depth is therefore limited by the arena, one TCB per group. The node count is the real
+constraint, not the stack.
+
+### The root's quantum is unbounded
+
+The root group's quantum is `u32::MAX`, so the top-level rotation is driven by each level-1
+node's *own* quantum. With a one-tick root quantum -- the obvious-looking choice, and what an
+earlier revision of this document described -- every level-1 node advances the root's cursor on
+every tick, which truncates any deeper visit to a single tick and makes a multi-tick visit
+impossible to complete. Depth 1 is still bit-for-bit the flat ring, because there it is the
+level-1 *leaf's* one-tick quantum that expires and moves the cursor.
+
+### Tests, all driven against the real tick path
+
+The `nested_tests` module in `src/scheduler.rs` runs thirteen cases through `on_tick` and
+`schedule_next` against hand-built TCB trees: depth-1 identity, underflow lap repetition,
+overflow truncation with resume, mid-visit preemption keeping the exact remainder, all-blocked
+bubbling up without burning the group's budget, a deadline expiring at depth while the group is
+starved, stale-cursor repair, depth 3, a multi-tick quantum at level 1 (four ticks with no
+switch, then exactly one), a lock wake reaching a waiter inside a group, **64 levels of
+nesting**, a **200-tick fairness sweep** across a mixed tree, and a **malformed parent cycle**
+that must terminate rather than spin.
+
+The fairness sweep is the one that states the headline promise: every runnable leaf runs, every
+tick goes to a leaf of the tree, and no run outlasts that leaf's own quantum.
+
+One harness correction came out of this: the test helper that builds TCBs by hand did not
+mirror `alloc_tcb`, so `KERNEL.nodes` stayed zero and every walk ran with a two-node budget.
+That was enough to pass the earlier cases while proving much less than it appeared to, which is
+why the helper now counts the nodes it creates.
+
+### On the board
+
+`examples/cortex-m-bluepill/src/bin/nested.rs` and
+`examples/cortex-m-blackpill/src/bin/nested.rs` build the same three-level tree, with the sums
+deliberately unequal in both directions: `ctrl` (5 ms) holding children totalling 4 ms, and
+`fast` (1 ms) holding children totalling 4 ms. Each leaf holds an absolute 10 ms deadline and
+reports its worst lateness, so the run measures wall-clock sleep correctness at depth. On the
+Black Pill the LED is one of the leaves inside the group, so the nesting is visible on the
+board rather than only in RTT. Both print a verdict; neither has been run on hardware yet.
+
+### The host backend does not tick in this scenario, and nesting is not the cause
+
+`nested_demo` reported `ticks 0` on Win32. `examples/host_tick_check.rs` is the probe that
+settled what that means: the same `SchedulerConfig`, in three modes -- a plain task, a group,
+and a group with two children -- printing `ticks` every 100 ms. **The flat mode stalls
+identically**, with no group anywhere in the tree, so the stall is a property of the host tick
+source (or of this workload) rather than of groups. `roundrobin_demo`, which uses the same
+configuration and CPU-bound tasks, ticks correctly in the same session.
+
+Consequence for this document: every claim here about *ordering* is verified on the host, and
+the claims about *timing at depth* are verified on no host yet. They are measurable on metal,
+where the tick is SysTick and the F103 fidelity run already measures ticks and early sleeps
+directly, and that is where they should be measured.

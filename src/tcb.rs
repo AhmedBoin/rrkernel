@@ -336,6 +336,16 @@ pub struct Kernel {
     /// the old flat ring: with only leaves under the root, the root's quantum and a
     /// level-1 leaf's quantum are the same number of ticks.
     pub root: UnsafeCell<*mut TaskControlBlock>,
+
+    /// TCBs handed out by `alloc_tcb` since init — a **monotonic upper bound** on the number
+    /// of scheduling nodes in the tree (a group never frees, and a reclaimed leaf may be
+    /// replaced later, so the live count is never larger than this).
+    ///
+    /// This is what bounds every tree walk. There is deliberately no fixed nesting limit:
+    /// depth is limited by memory, one TCB per group, and a walk cannot legitimately take
+    /// more steps than the tree has nodes — so a deep tree is legal, and a malformed one (a
+    /// parent cycle, which only a bug elsewhere could create) still terminates.
+    pub nodes: UnsafeCell<u32>,
 }
 
 // SAFETY: all mutation is funneled through `critical` sections and the raw
@@ -367,6 +377,7 @@ impl Kernel {
             idle_waits: UnsafeCell::new(0),
             config: UnsafeCell::new(KernelConfig::default_const()),
             root: UnsafeCell::new(ptr::null_mut()),
+            nodes: UnsafeCell::new(0),
         }
     }
 
