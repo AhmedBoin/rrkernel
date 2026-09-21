@@ -2288,6 +2288,57 @@ mod nested_tests {
                     assert!(seen.contains(&id), "the walk missed node {}", id);
                 }
             }
+            // --- window wider than the lap: the children rotate undisturbed -------------
+            {
+                // 2ms window over children of 1ms and 0.5ms. At a 500us tick that is 4 ticks
+                // over 2 and 1, so the lap (3) is shorter than the window (4) and no turn is ever
+                // cut short: the group re-enters its lap one tick later each time, and the
+                // children simply rotate 2:1 with their own quanta intact.
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let g = node(NodeKind::Group, 4, 900);
+                let one_ms = node(NodeKind::Leaf, 2, 901);
+                let half_ms = node(NodeKind::Leaf, 1, 902);
+                attach(root, &[g]);
+                attach(g, &[one_ms, half_ms]);
+                install(root, ptr::null_mut());
+                let mut got: Vec<u32> = Vec::new();
+                for _ in 0..12 {
+                    got.push((*tick()).id);
+                }
+                assert_eq!(
+                    got,
+                    vec![901, 901, 902, 901, 901, 902, 901, 901, 902, 901, 901, 902],
+                    "a window wider than the lap must leave the children rotating undisturbed"
+                );
+            }
+
+            // --- window narrower than the lap: cut mid-turn, resume ---------------------
+            {
+                // 3ms window over children of 1.5ms, 2ms and 4ms: at a 500us tick, 6 ticks over
+                // 3, 4 and 8. Every window cuts a turn short and the next window resumes it with
+                // exactly the time it had left, written out over four windows:
+                // th1 3 | th2 3, then th2 1 | th3 5, then th3 3 | th1 3, then th2 4 | th3 2.
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let g = node(NodeKind::Group, 6, 900);
+                let th1 = node(NodeKind::Leaf, 3, 901);
+                let th2 = node(NodeKind::Leaf, 4, 902);
+                let th3 = node(NodeKind::Leaf, 8, 903);
+                attach(root, &[g]);
+                attach(g, &[th1, th2, th3]);
+                install(root, ptr::null_mut());
+                let mut got: Vec<u32> = Vec::new();
+                for _ in 0..24 {
+                    got.push((*tick()).id);
+                }
+                assert_eq!(
+                    got,
+                    vec![
+                        901, 901, 901, 902, 902, 902, 902, 903, 903, 903, 903, 903, 903, 903, 903,
+                        901, 901, 901, 902, 902, 902, 902, 903, 903
+                    ],
+                    "each window must resume the cut turn with its remaining time"
+                );
+            }
         }
     }
 }

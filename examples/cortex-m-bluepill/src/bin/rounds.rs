@@ -147,10 +147,14 @@ fn main() {
 
     // ---------------- Phase A: window wider than the lap ----------------
     let a_grp = thread::spawn_group(Parent::Root, Slice::Millis(2)).expect("group A");
-    thread::spawn_in(Parent::Group(a_grp), Slice::Millis(1), || measured(A1, &STOP_A))
-        .expect("a1");
-    thread::spawn_in(Parent::Group(a_grp), Slice::Micros(500), || measured(A2, &STOP_A))
-        .expect("a2");
+    thread::spawn_in(Parent::Group(a_grp), Slice::Millis(1), || {
+        measured(A1, &STOP_A)
+    })
+    .expect("a1");
+    thread::spawn_in(Parent::Group(a_grp), Slice::Micros(500), || {
+        measured(A2, &STOP_A)
+    })
+    .expect("a2");
     wait_ticks(WAIT);
     let mut seq = [0u32; MEASURE];
     let n_a = read_log(&mut seq, MEASURE);
@@ -164,12 +168,18 @@ fn main() {
     // ---------------- Phase B: window narrower than the lap ----------------
     reset_log();
     let b_grp = thread::spawn_group(Parent::Root, Slice::Millis(3)).expect("group B");
-    thread::spawn_in(Parent::Group(b_grp), Slice::Micros(1500), || measured(B1, &STOP_B))
-        .expect("b1");
-    thread::spawn_in(Parent::Group(b_grp), Slice::Millis(2), || measured(B2, &STOP_B))
-        .expect("b2");
-    thread::spawn_in(Parent::Group(b_grp), Slice::Millis(4), || measured(B3, &STOP_B))
-        .expect("b3");
+    thread::spawn_in(Parent::Group(b_grp), Slice::Micros(1500), || {
+        measured(B1, &STOP_B)
+    })
+    .expect("b1");
+    thread::spawn_in(Parent::Group(b_grp), Slice::Millis(2), || {
+        measured(B2, &STOP_B)
+    })
+    .expect("b2");
+    thread::spawn_in(Parent::Group(b_grp), Slice::Millis(4), || {
+        measured(B3, &STOP_B)
+    })
+    .expect("b3");
     wait_ticks(WAIT);
     let n_b = read_log(&mut seq, MEASURE);
     STOP_B.store(1, Ordering::Relaxed);
@@ -180,9 +190,23 @@ fn main() {
 
     let st = scheduler::stats();
     rprintln!("--- rounds report -------------------------------------------");
-    rprintln!("phase A     : {} ticks, {} runs, both children seen: {}", n_a, runs_a, both_a);
-    rprintln!("phase B     : {} ticks, {} runs, all three seen: {}", n_b, runs_b, all_b);
-    rprintln!("overruns    : A {} tick(s), B {} tick(s) (want 0 each)", over_a, over_b);
+    rprintln!(
+        "phase A     : {} ticks, {} runs, both children seen: {}",
+        n_a,
+        runs_a,
+        both_a
+    );
+    rprintln!(
+        "phase B     : {} ticks, {} runs, all three seen: {}",
+        n_b,
+        runs_b,
+        all_b
+    );
+    rprintln!(
+        "overruns    : A {} tick(s), B {} tick(s) (want 0 each)",
+        over_a,
+        over_b
+    );
     rprintln!("kernel      : ticks {} switches {}", st.ticks, st.switches);
     rprintln!("-----------------------------------------------------------");
 
