@@ -57,7 +57,7 @@ static EARLY: AtomicU32 = AtomicU32::new(0);
 /// What every counter leaf runs: count turns against an absolute deadline, and record the
 /// worst lateness and any early wake. The figure is in milliseconds because that is the unit
 /// `now()` returns, and one tick is 1 ms here, so `1` means "within one tick".
-fn leaf(runs: &AtomicU32, late: &AtomicU32) {
+fn leaf(name: &'static str, runs: &AtomicU32, late: &AtomicU32) {
     let period = Duration::from_millis(PERIOD_MS);
     let mut next = rrkernel::deadline_after(period);
     loop {
@@ -69,6 +69,12 @@ fn leaf(runs: &AtomicU32, late: &AtomicU32) {
             EARLY.fetch_add(1, Ordering::Relaxed);
         }
         runs.fetch_add(1, Ordering::Relaxed);
+        // A progress line every hundred turns: the report is a single snapshot, and the
+        // terminal should show the tree alive for as long as the probe stays attached.
+        let n = runs.load(Ordering::Relaxed);
+        if n % 100 == 0 {
+            rprintln!("[{}] {} turns at t={} ms", name, n, rrkernel::now());
+        }
         // The next *absolute* deadline: a wake that lands a tick late is corrected on the
         // next period instead of accumulating, which is what makes the figure meaningful.
         next = rrkernel::deadline_add(next, period);
@@ -103,15 +109,15 @@ fn main() {
         thread::spawn_group(Parent::Group(ctrl), Slice::Millis(1)).expect("spawn_group fast");
 
     thread::spawn_in(Parent::Group(fast), Slice::Millis(2), || {
-        leaf(&A_RUNS, &A_LATE)
+        leaf("a", &A_RUNS, &A_LATE)
     })
     .expect("spawn_in a");
     thread::spawn_in(Parent::Group(fast), Slice::Millis(2), || {
-        leaf(&B_RUNS, &B_LATE)
+        leaf("b", &B_RUNS, &B_LATE)
     })
     .expect("spawn_in b");
     thread::spawn_in(Parent::Group(ctrl), Slice::Millis(2), || {
-        leaf(&LOG_RUNS, &LOG_LATE)
+        leaf("log", &LOG_RUNS, &LOG_LATE)
     })
     .expect("spawn_in log");
 
@@ -129,7 +135,7 @@ fn main() {
     .expect("spawn_in led");
 
     // The ordinary path, unchanged: level 1 under the root, on the slice `configure` set.
-    thread::spawn(|| leaf(&BG_RUNS, &BG_LATE));
+    thread::spawn(|| leaf("bg", &BG_RUNS, &BG_LATE));
 
     // A quantum shorter than one tick cannot be honoured, so it is refused with the numbers
     // in the error rather than silently rounded up to a tick.
