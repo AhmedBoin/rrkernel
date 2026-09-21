@@ -789,7 +789,7 @@ unsafe fn walk_tree<F: FnMut(*mut TaskControlBlock)>(first: *mut TaskControlBloc
                 return;
             }
             let parent = (*p).parent;
-            if parent.is_null() || parent == owner {
+            if parent.is_null() {
                 return;
             }
             let entry = (*parent).children_head;
@@ -797,6 +797,15 @@ unsafe fn walk_tree<F: FnMut(*mut TaskControlBlock)>(first: *mut TaskControlBloc
             if is_linked(next) && next != entry {
                 p = next;
                 break;
+            }
+            // This ring is exhausted: ascend, unless the owner ring has just been finished, in
+            // which case the walk is over. Looking for a sibling *before* giving up on the owner
+            // is the whole point. With a leaf at the head of a ring -- which is what the blue-pill
+            // has, since task 0 is first -- the earlier ordering returned from the head itself,
+            // visiting one node and leaving every later sibling, and its whole subtree, unwoken.
+            // Their sleeps never expired, so the board printed nothing after its first two lines.
+            if parent == owner {
+                return;
             }
             p = parent;
         }
@@ -1457,11 +1466,18 @@ unsafe fn insert_child(parent: *mut TaskControlBlock, node: *mut TaskControlBloc
 /// or fiber on the OS-backed ports.
 ///
 /// # Safety
-/// Caller holds a critical section.
+/// Takes its own critical section, so no caller-side locking is required.
 pub(crate) unsafe fn spawn_group_node(
     parent: *mut TaskControlBlock,
     quantum_ticks: u32,
 ) -> Result<*mut TaskControlBlock, SpawnError> {
+    // Its own critical section, exactly like `spawn_internal`. A group spawn mutates the child
+    // ring and the arena, and on metal the tick interrupt fires every slice; without this the
+    // mutation races the ISR that walks the very ring being edited. That is what hung the
+    // blue-pill the first time a group was spawned on hardware -- and it could not show on
+    // Windows, where the tick source was stalled in this scenario and never raced it. The guard
+    // is RAII, so every early return below releases it.
+    let g = crate::critical::enter();
     if !(*arena()).is_ready() {
         return Err(SpawnError::NotInitialized);
     }
@@ -1478,6 +1494,7 @@ pub(crate) unsafe fn spawn_group_node(
     (*tcb).slice_cycles = quantum_ticks.max(1);
     (*tcb).remaining_cycles = quantum_ticks.max(1);
     insert_child(parent, tcb);
+    drop(g);
     Ok(tcb)
 }
 
@@ -2146,6 +2163,32 @@ mod nested_tests {
                 let mut visited = 0u32;
                 walk_tree((*root).children_head, &mut |_| visited += 1);
                 assert!(visited != 0, "the walk visited something before giving up");
+            }
+
+            // --- the walk visits every node, including siblings of the head leaf -----
+            {
+                // This is the shape the board found. The wake sweep walks the tree from the
+                // ring head, and on the blue-pill the head is *task 0, a leaf* -- with the
+                // groups after it. A walk that stopped once it had ascended to the head's
+                // parent visited exactly one node, so every later task sleep never expired
+                // and the board sat there with nothing to print after the first two lines.
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let head = node(NodeKind::Leaf, 1, 700);
+                let g = node(NodeKind::Group, 4, 701);
+                let inner = node(NodeKind::Leaf, 1, 702);
+                let tail = node(NodeKind::Leaf, 1, 703);
+                attach(root, &[head, g, tail]);
+                attach(g, &[inner]);
+                let mut seen: Vec<u32> = Vec::new();
+                walk_tree((*root).children_head, &mut |p| seen.push((*p).id));
+                assert_eq!(
+                    seen.len(),
+                    4,
+                    "the walk must reach the head leaf, the group, its child and the last leaf"
+                );
+                for id in [700u32, 701, 702, 703] {
+                    assert!(seen.contains(&id), "the walk missed node {}", id);
+                }
             }
         }
     }
