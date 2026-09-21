@@ -83,6 +83,7 @@ counter, so it wakes 5ms later in real time however often the group holding it a
 
 On the F103, a 2ms group sharing the top level with a 1ms flat task splits the CPU close to 2:1 -
 456k against 235k loop iterations over the same run.
+
 ## What's solid vs. what's not
 
 - Cortex-M (M0/M0+/M3/M4/M7/M33): **verified on real hardware** (STM32F103 Blue Pill)
