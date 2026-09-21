@@ -680,7 +680,17 @@ unsafe fn pick_next_leaf(cur: *mut TaskControlBlock) -> *mut TaskControlBlock {
     if z.is_null() {
         // Nothing on the path is out of quantum: the leaf keeps the CPU, so this tick
         // ends without a switch.
-        return cur;
+        if runnable(cur) {
+            return cur;
+        }
+        // The current task is not runnable any more: it blocked (a sleep, or a lock) and still
+        // had quantum left. Returning it here handed the CPU straight back to the task that had
+        // just asked to be switched away from, so PendSV switched to *it*, `sleep_until_tick`
+        // re-blocked it, and the whole system ping-ponged in that retry loop while ticks, the
+        // other tasks and every wake-up stopped. On the board: `ticks=0` for ever, `spin=0`,
+        // `wakes=0` -- with no groups involved at all, which is why it looked like a nesting bug
+        // and why no host run could see it (the host tick source was stalled in that scenario).
+        return advance_from(root);
     }
     if z == root {
         // The root's own quantum closed: the top-level rotation advances, which for a
@@ -2057,6 +2067,28 @@ mod nested_tests {
                     "a cursor pointing at a dead, unlinked child must not wedge the group"
                 );
                 assert_eq!((*g).current_child, live, "and the cursor is repaired");
+            }
+
+            // --- a task that blocks mid-quantum must not be handed the CPU back -----
+            {
+                // The board bug, in one case. `sleep_until_tick` blocks and re-checks in a loop,
+                // relying on the switch actually happening; a task that blocks with quantum left
+                // kept `remaining_cycles != 0`, so the no-switch path returned it and the switch
+                // never happened. Every sleeper on every port spun there for ever.
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let blocker = node(NodeKind::Leaf, 5, 800);
+                let other = node(NodeKind::Leaf, 1, 801);
+                attach(root, &[blocker, other]);
+                install(root, blocker);
+                (*blocker).state = TaskState::Blocked;
+                (*blocker).block_deadline = 100;
+                (*blocker).remaining_cycles = 4; // plenty of quantum left
+                let who = tick();
+                assert_eq!(
+                    (*who).id,
+                    801,
+                    "a blocked task must not be dispatched again just because it has quantum left"
+                );
             }
 
             // --- deep nesting: bounded by memory, not by a constant -----------------

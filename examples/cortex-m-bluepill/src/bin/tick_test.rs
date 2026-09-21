@@ -22,7 +22,10 @@ const CORE_HZ: u32 = 8_000_000;
 #[cortex_m_rt::entry]
 fn main() {
     configure(CORE_HZ, Slice::Millis(1), 1024);
-    rprintln!("tick_test: tick {} ns, one task, no groups", rrkernel::tick_ns());
+    rprintln!(
+        "tick_test: tick {} ns, one task, no groups",
+        rrkernel::tick_ns()
+    );
 
     let mut last: u64 = u64::MAX;
     let mut n: u32 = 0;

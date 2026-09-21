@@ -80,7 +80,10 @@ fn main() {
     })
     .expect("gsleep");
 
-    rprintln!("diag: tick {} ns, tasks spawned, main now spins", rrkernel::tick_ns());
+    rprintln!(
+        "diag: tick {} ns, tasks spawned, main now spins",
+        rrkernel::tick_ns()
+    );
 
     // Main never blocks, so a broken wake path cannot hide here: it is always runnable and
     // always comes back. The line below is the whole experiment.

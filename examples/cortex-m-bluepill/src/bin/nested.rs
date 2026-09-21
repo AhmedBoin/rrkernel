@@ -87,6 +87,9 @@ fn leaf(name: &'static str, runs: &AtomicU32, late: &AtomicU32) {
 #[rrkernel(log = rtt)]
 #[cortex_m_rt::entry]
 fn main() {
+    // The first line out, before anything else: if this never appears, nothing after it ran and
+    // the fault is in startup or `configure` rather than in the tree.
+    rprintln!("nested: starting");
     configure(CORE_HZ, Slice::Millis(1), 1024);
     rprintln!(
         "nested: tick {} ns, tree = 2 groups + {} leaves",
