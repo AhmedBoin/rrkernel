@@ -6,6 +6,10 @@ description = "rrkernel in a plain cortex-m-rt application (STM32F103C8 'Blue Pi
 license = "MIT"
 publish = false
 
+# The flat example is this crate default target, so `cargo run` keeps working now that the
+# diagnostic bins below exist (without this, `cargo run` is ambiguous and refuses).
+default-run = "cortex-m-bluepill"
+
 [dependencies]
 # The kernel. A path dependency like any other crate.
 rrkernel = { path = "../.." }
