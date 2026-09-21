@@ -692,6 +692,23 @@ unsafe fn pick_next_leaf(cur: *mut TaskControlBlock) -> *mut TaskControlBlock {
         // and why no host run could see it (the host tick source was stalled in that scenario).
         return advance_from(root);
     }
+    // A leaf on the path whose own quantum is spent has had its turn -- even when what ended
+    // the visit was an *ancestor's* window closing on the same tick. Without this, the group's
+    // cursor was never advanced (the outermost rule suppressed it), so re-entering the group
+    // found the same spent child, re-armed it, and ran it again: the sibling starved outright.
+    // Measured before the fix, for a 2-tick window over children of 2 and 3 ticks: 24 ticks to
+    // the first child, 0 to the second. A lone child is unaffected -- advancing from it lands
+    // back on itself -- and a child preempted with time left keeps its turn, because its
+    // remaining quantum is not zero.
+    if z != cur && (*cur).remaining_cycles == 0 {
+        let parent = (*cur).parent;
+        if !parent.is_null() {
+            let next = crate::ring::next_runnable(cur);
+            if !next.is_null() && (*next).parent == parent {
+                (*parent).current_child = next;
+            }
+        }
+    }
     if z == root {
         // The root's own quantum closed: the top-level rotation advances, which for a
         // depth-1 tree is exactly `ring::next_runnable(current_leaf)`.
@@ -2088,6 +2105,55 @@ mod nested_tests {
                     (*who).id,
                     801,
                     "a blocked task must not be dispatched again just because it has quantum left"
+                );
+            }
+
+            // --- a group window closing exactly with its child quantum ----------------
+            {
+                // A 2-tick window over children of 2 and 3 ticks. The first child spends the
+                // whole window, so the window and the child run out on the *same* tick, and the
+                // outermost-exhausted rule ends the visit there. The next visit must not hand the
+                // same child a fresh quantum: that starves its sibling, the one thing this
+                // scheduler exists to rule out.
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let g = node(NodeKind::Group, 2, 900);
+                let a = node(NodeKind::Leaf, 2, 901);
+                let b = node(NodeKind::Leaf, 3, 902);
+                attach(root, &[g]);
+                attach(g, &[a, b]);
+                install(root, a);
+                let mut a_ticks = 0u32;
+                let mut b_ticks = 0u32;
+                let mut order: Vec<u32> = Vec::new();
+                for _ in 0..24 {
+                    let id = (*tick()).id;
+                    if id == 901 {
+                        a_ticks += 1;
+                    }
+                    if id == 902 {
+                        b_ticks += 1;
+                    }
+                    if order.last() != Some(&id) {
+                        order.push(id);
+                    }
+                }
+                assert!(
+                    a_ticks != 0 && b_ticks != 0,
+                    "a child never ran: a {} b {} order {:?}",
+                    a_ticks,
+                    b_ticks,
+                    order
+                );
+                // Measured, not assumed: the children alternate in units of their own quanta --
+                // 2 ticks for the first, 3 for the second -- with the group 2-tick window
+                // truncating and resuming around them. The share is their ratio 2:3 to within one
+                // boundary tick, because 24 ticks is not a whole number of 5-tick cycles.
+                assert!(
+                    matches!((a_ticks * 3).abs_diff(b_ticks * 2), 0..=3),
+                    "per-child quanta are not being honoured: a {} b {} order {:?}",
+                    a_ticks,
+                    b_ticks,
+                    order
                 );
             }
 
