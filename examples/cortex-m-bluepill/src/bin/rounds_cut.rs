@@ -97,7 +97,13 @@ fn main() {
     let mut seq = [0u32; READ];
     let n = read_log(&mut seq);
     rprintln!("--- narrow window: 3ms group over 1.5ms, 2ms and 4ms children ---");
-    rprintln!("measured ticks {} to {} (asked {}), {} log entries", t0, t1, MEASURE_TICKS, LOG_N.load(Ordering::Acquire));
+    rprintln!(
+        "measured ticks {} to {} (asked {}), {} log entries",
+        t0,
+        t1,
+        MEASURE_TICKS,
+        LOG_N.load(Ordering::Acquire)
+    );
 
     let mut spent = [0u32; 3];
     let mut worst = 0u32;
@@ -122,7 +128,15 @@ fn main() {
         rprintln!("  {} x {} tick(s), quantum {}", id, len, q);
         i += len;
     }
-    rprintln!("spent: {} {} ticks, {} {} ticks, {} {} ticks", B1, spent[0], B2, spent[1], B3, spent[2]);
+    rprintln!(
+        "spent: {} {} ticks, {} {} ticks, {} {} ticks",
+        B1,
+        spent[0],
+        B2,
+        spent[1],
+        B3,
+        spent[2]
+    );
     rprintln!("kernel: ticks {} switches {}", st.ticks, st.switches);
 
     let ok = spent[0] != 0 && spent[1] != 0 && spent[2] != 0 && worst == 0;

@@ -26,7 +26,6 @@ use rrkernel::{configure, scheduler, Slice};
 use rtt_target::rprintln;
 use stm32f4xx_hal::{pac, prelude::*, rcc::Config};
 
-
 const LOG_MAX: usize = 128;
 const MEASURE_TICKS: u64 = 48;
 const READ: usize = 36;
@@ -91,7 +90,11 @@ fn main() {
     let rcc = dp.RCC.freeze(Config::hsi().sysclk(16.MHz()));
     let sysclk = rcc.clocks.sysclk().to_Hz();
     configure(sysclk, Slice::Micros(500), 2048);
-    rprintln!("rounds-101/102: {} Hz, tick {} ns", sysclk, rrkernel::tick_ns());
+    rprintln!(
+        "rounds-101/102: {} Hz, tick {} ns",
+        sysclk,
+        rrkernel::tick_ns()
+    );
 
     // A 2ms window (4 ticks) over children of 1ms (2 ticks) and 0.5ms (1 tick). The lap is 3
     // ticks, so the window is wider than the lap: no turn is ever cut short.
@@ -107,7 +110,13 @@ fn main() {
     let mut seq = [0u32; READ];
     let n = read_log(&mut seq);
     rprintln!("--- wide window: 2ms group over 1ms and 0.5ms children ---");
-    rprintln!("measured ticks {} to {} (asked {}), {} log entries", t0, t1, MEASURE_TICKS, LOG_N.load(Ordering::Acquire));
+    rprintln!(
+        "measured ticks {} to {} (asked {}), {} log entries",
+        t0,
+        t1,
+        MEASURE_TICKS,
+        LOG_N.load(Ordering::Acquire)
+    );
 
     let mut c1 = 0u32;
     let mut c2 = 0u32;

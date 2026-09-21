@@ -101,7 +101,13 @@ fn main() {
     let mut seq = [0u32; READ];
     let n = read_log(&mut seq);
     rprintln!("--- wide window: 2ms group over 1ms and 0.5ms children ---");
-    rprintln!("measured ticks {} to {} (asked {}), {} log entries", t0, t1, MEASURE_TICKS, LOG_N.load(Ordering::Acquire));
+    rprintln!(
+        "measured ticks {} to {} (asked {}), {} log entries",
+        t0,
+        t1,
+        MEASURE_TICKS,
+        LOG_N.load(Ordering::Acquire)
+    );
 
     let mut c1 = 0u32;
     let mut c2 = 0u32;

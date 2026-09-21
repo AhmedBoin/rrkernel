@@ -2339,6 +2339,80 @@ mod nested_tests {
                     "each window must resume the cut turn with its remaining time"
                 );
             }
+            // --- a group inside a group, both directions at once -----------------------
+            {
+                // The README shape: a 4ms control group holding a 2ms task and a 3ms filters
+                // group whose own children ask for 1ms each. The top overflows (2+3 is more than
+                // 4) while the bottom underflows (1+1 is less than 3), so both have to work at
+                // the same time and at the same depth. In steady state the split is the
+                // configured 2:1:1, and a group is never dispatched as if it were a task.
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let control = node(NodeKind::Group, 4, 900);
+                let read_sensor = node(NodeKind::Leaf, 2, 901);
+                let filters = node(NodeKind::Group, 3, 902);
+                let low_pass = node(NodeKind::Leaf, 1, 903);
+                let notch = node(NodeKind::Leaf, 1, 904);
+                attach(root, &[control]);
+                attach(control, &[read_sensor, filters]);
+                attach(filters, &[low_pass, notch]);
+                install(root, ptr::null_mut());
+                let mut got: Vec<u32> = Vec::new();
+                for _ in 0..24 {
+                    got.push((*tick()).id);
+                }
+                let mut rs = 0u32;
+                let mut lp = 0u32;
+                let mut nt = 0u32;
+                for id in &got {
+                    match *id {
+                        901 => rs += 1,
+                        903 => lp += 1,
+                        904 => nt += 1,
+                        other => panic!("dispatched {} - not one of the leaves", other),
+                    }
+                }
+                assert!(
+                    rs != 0 && lp != 0 && nt != 0,
+                    "starvation: read_sensor {} low_pass {} notch {} in {:?}",
+                    rs,
+                    lp,
+                    nt,
+                    got
+                );
+                // No turn outlasts the time its own task asked for, and the two windows are both
+                // honoured. read_sensor gets 2 ticks per control lap; the filters group gets its
+                // own 3, which does not fit in one 4ms window beside a 2ms task, so it arrives
+                // across two windows. Long-run split between read_sensor and the filters children
+                // is therefore 2:3, not the 2:1:1 that the group quanta alone might suggest.
+                let q = |id: u32| if id == 901 { 2 } else { 1 };
+                let mut worst = 0u32;
+                let mut run = 0u32;
+                let mut last = 0u32;
+                for id in &got {
+                    if *id == last {
+                        run += 1;
+                    } else {
+                        if last != 0 && run > q(last) {
+                            worst = run - q(last);
+                        }
+                        last = *id;
+                        run = 1;
+                    }
+                }
+                assert!(
+                    worst == 0,
+                    "a turn ran {} tick(s) past its own quantum in {:?}",
+                    worst,
+                    got
+                );
+                assert!(
+                    matches!((rs * 3).abs_diff((lp + nt) * 2), 0..=3),
+                    "the windows are not honoured: read_sensor {} filters children {} in {:?}",
+                    rs,
+                    lp + nt,
+                    got
+                );
+            }
         }
     }
 }

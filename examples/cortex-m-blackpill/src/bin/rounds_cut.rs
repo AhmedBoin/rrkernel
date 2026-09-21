@@ -23,7 +23,6 @@ use rrkernel::{configure, scheduler, Slice};
 use rtt_target::rprintln;
 use stm32f4xx_hal::{pac, prelude::*, rcc::Config};
 
-
 const LOG_MAX: usize = 128;
 const MEASURE_TICKS: u64 = 48;
 const READ: usize = 36;
@@ -88,7 +87,11 @@ fn main() {
     let rcc = dp.RCC.freeze(Config::hsi().sysclk(16.MHz()));
     let sysclk = rcc.clocks.sysclk().to_Hz();
     configure(sysclk, Slice::Micros(500), 2048);
-    rprintln!("rounds-201/202/203: {} Hz, tick {} ns", sysclk, rrkernel::tick_ns());
+    rprintln!(
+        "rounds-201/202/203: {} Hz, tick {} ns",
+        sysclk,
+        rrkernel::tick_ns()
+    );
 
     let g = thread::spawn_group(Parent::Root, Slice::Millis(3)).expect("group");
     thread::spawn_in(Parent::Group(g), Slice::Micros(1500), || measured(B1)).expect("b1");
@@ -103,7 +106,13 @@ fn main() {
     let mut seq = [0u32; READ];
     let n = read_log(&mut seq);
     rprintln!("--- narrow window: 3ms group over 1.5ms, 2ms and 4ms children ---");
-    rprintln!("measured ticks {} to {} (asked {}), {} log entries", t0, t1, MEASURE_TICKS, LOG_N.load(Ordering::Acquire));
+    rprintln!(
+        "measured ticks {} to {} (asked {}), {} log entries",
+        t0,
+        t1,
+        MEASURE_TICKS,
+        LOG_N.load(Ordering::Acquire)
+    );
 
     let mut spent = [0u32; 3];
     let mut worst = 0u32;
@@ -128,7 +137,15 @@ fn main() {
         rprintln!("  {} x {} tick(s), quantum {}", id, len, q);
         i += len;
     }
-    rprintln!("spent: {} {} ticks, {} {} ticks, {} {} ticks", B1, spent[0], B2, spent[1], B3, spent[2]);
+    rprintln!(
+        "spent: {} {} ticks, {} {} ticks, {} {} ticks",
+        B1,
+        spent[0],
+        B2,
+        spent[1],
+        B3,
+        spent[2]
+    );
     rprintln!("kernel: ticks {} switches {}", st.ticks, st.switches);
 
     let ok = spent[0] != 0 && spent[1] != 0 && spent[2] != 0 && worst == 0;
