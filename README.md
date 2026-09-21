@@ -96,8 +96,8 @@ A 2ms group holding two tasks, one asking for 1ms and one for 0.5ms (`th1`, `th2
 ```text
    the group turn, 2ms                                the group turn again, 2ms
    +-------------------------------+            +-------------------------------+
-   | th1 1ms   | th2 0.5ms | th1    |    ...     | th1 0.5ms  | th2 0.5ms | th1 |
-   |           |           | 0.5ms  |            | (leftover) |           | 1ms |
+   | th1 1ms   | th2 0.5ms | th1   |    ...     | th1 0.5ms  | th2 0.5ms | th1  |
+   |           |           | 0.5ms |            | (leftover) |           | 1ms  |
    +-------------------------------+            +-------------------------------+
                                           ^
                         th1 was cut here with 0.5ms still left, so the
@@ -115,8 +115,8 @@ The same holds when the tasks inside need more time than one slot. A 3ms group o
 
 ```text
    slot 1:  | th1 1.5ms | th2 1.5ms |
-   slot 2:               | th2 0.5ms | th3 2.5ms |
-   slot 3:                            | th3 1.5ms | th1 1.5ms |
+   slot 2:              | th2 0.5ms | th3 2.5ms |
+   slot 3:                          | th3 1.5ms | th1 1.5ms |
 ```
 
 Each line starts where the line before it stopped. `th2` was cut with 0.5ms left, so it opens the
