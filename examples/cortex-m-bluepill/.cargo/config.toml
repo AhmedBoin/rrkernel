@@ -4,7 +4,15 @@
 runner = "probe-rs run --chip STM32F103C8"
 # `cortex-m-rt` ships `link.x`; it `INCLUDE`s our `memory.x`, which the build script
 # puts on the linker's search path.
-rustflags = ["-C", "link-arg=-Tlink.x"]
+rustflags = [
+    "-C",
+    "link-arg=-Tlink.x",
+    # Added only to read the memory map: it merges with the line above, which is the whole
+    # point. Passing the same flag through RUSTFLAGS instead makes cargo *ignore* this file,
+    # and then -Tlink.x is lost and the link produces an image with no loadable segments.
+    "-C",
+    "link-arg=-Map=D:/Development/Rust/rrkernel/examples/cortex-m-bluepill/map_real.txt",
+]
 
 [build]
 # So `cargo build` / `cargo run` in this directory need no `--target`.
