@@ -1,60 +1,38 @@
-//! How far does startup actually get? Four values at one fixed RAM address, no output channel.
+//! A sleeper that wakes and then prints, while nothing else is runnable in between.
 //!
-//! 0x20004700 is just above .bss and well below the stack top, and every write is volatile, so the
-//! value survives optimisation. Read it with probe-rs read b32 0x20004700 1 (the core must be
-//! halted, which reading does):
-//!
-//! * 0x11 - the reset path ran, but the entry function was never reached
-//! * 0x22 - the entry function was reached, but the RTT init did not complete
-//! * 0x44 - RTT init returned; the firmware is now spinning here
+//! This is the decisive shape: the tick has to come from the idle path, and whatever prints must
+//! print after the CPU has been idle. If the output appears at all, the idle path works and an
+//! earlier silence was the terminal losing sight of the target rather than the kernel failing.
+//! No fixed-address breadcrumbs: 0x20004700 lands inside rrkernel::scheduler::ARENA in this image.
 
 #![no_std]
 #![no_main]
 
 use rrkernel::rrkernel;
 use rrkernel::{configure, thread, Slice};
-
-const CORE_HZ: u32 = 8_000_000;
 use rtt_target::rprintln;
 
-const BREADCRUMB: *mut u32 = 0x2000_4700 as *mut u32;
-
-fn crumb(v: u32) {
-    unsafe { core::ptr::write_volatile(BREADCRUMB, v) }
-}
-
-/// Called by the reset handler before .data is copied and .bss is zeroed.
-#[cortex_m_rt::pre_init]
-unsafe fn pre_init() {
-    core::ptr::write_volatile(BREADCRUMB, 0x11);
-}
+const CORE_HZ: u32 = 8_000_000;
 
 #[rrkernel]
 #[cortex_m_rt::entry]
 fn main() -> ! {
-    crumb(0x22);
-    // The critical-section implementation has to be linked, or rtt-target fails at link time.
     let _ = cortex_m::interrupt::free(|_cs| ());
     rtt_target::rtt_init_print!();
-    crumb(0x33);
-    rprintln!("life7: configure done; a second task will sleep 200ms and then spin");
+    rprintln!("life7: RTT is up");
+    configure(CORE_HZ, Slice::Millis(1), 1024);
+    rprintln!("life7: kernel configured");
     thread::spawn(|| {
+        // Nothing else will be runnable for these 200 ticks: the idle path has to deliver them.
         rrkernel::sleep_ms(200);
-        rprintln!(
-            "life7: the SECOND task woke at {} ticks - so wakes work while idling",
-            rrkernel::now()
-        );
+        rprintln!("life7: the sleeper woke at {} ticks", rrkernel::now());
         loop {
-            core::hint::spin_loop();
+            rprintln!("life7: awake at {} ticks", rrkernel::now());
+            cortex_m::asm::delay(2_000_000);
         }
     });
-    configure(CORE_HZ, Slice::Millis(1), 1024);
-    crumb(0x55);
-    rprintln!("life3: kernel configured");
-    rprintln!("life: startup and RTT both work");
+    rprintln!("life7: child spawned, main now sleeping");
     loop {
-        rrkernel::sleep_ms(50);
-        crumb(0x44);
-        rprintln!("life6: main woke at {} ticks", rrkernel::now());
+        rrkernel::sleep_ms(1000);
     }
 }
