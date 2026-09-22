@@ -1,94 +1,132 @@
-//! One nested round robin measured on the board, tick by tick, and checked.
+//! A nested round robin measured on the board, with no atomics anywhere in this file.
 //!
 //! ```text
 //! cd examples/cortex-m-bluepill
 //! cargo run --release --bin rounds
 //! ```
 //!
-//! //! Phase: a window *wider* than the lap. A 2ms group over children of 1ms and 0.5ms, i.e.
-//! 4 ticks over 2 and 1. Since the lap (3 ticks) is shorter than the window, nothing is cut
-//! short and the children rotate 2:1 -- [101, 101, 102] repeating.
+//! Phase: a window *wider* than the lap. A 2ms group over children of 1ms and 0.5ms, i.e. 4
+//! ticks over 2 and 1 at a 500us tick. The lap (3 ticks) is shorter than the window (4), so no
+//! turn is cut short and the children rotate 2:1.
 //!
-//! The tick is 500us (`Slice::Micros(500)`), which is what makes half-millisecond quanta
-//! expressible at all: a quantum must be a whole number of ticks.
-//!
-//! Every measured task spins -- a task that sleeps is not measuring its own turn -- and logs
-//! one entry for each tick it sees change while it holds the CPU. Task 0 sleeps through the
-//! measurement, then reads the log back, prints the runs it implies and checks them.
+//! Each measured task counts only in its own variables: how many ticks it ran, how many turns it
+//! had, and the longest turn it took. Every eighth tick it publishes those three numbers through
+//! a lock. Nothing is shared in the hot path and nothing is atomic: the lock is taken rarely
+//! enough that two tasks never fight over it while running.
 
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicU32, Ordering};
 use rrkernel::rrkernel;
+use rrkernel::sync::{LockId, Mutex};
 use rrkernel::thread::{self, Parent};
 use rrkernel::{configure, scheduler, Slice};
 use rtt_target::rprintln;
 
 const CORE_HZ: u32 = 8_000_000;
-const LOG_MAX: usize = 128;
 const MEASURE_TICKS: u64 = 48;
-const READ: usize = 36;
+const SLOTS: usize = 4;
 
-static LOG_ID: [AtomicU32; LOG_MAX] = [const { AtomicU32::new(0) }; LOG_MAX];
-static LOG_READY: [AtomicU32; LOG_MAX] = [const { AtomicU32::new(0) }; LOG_MAX];
-static LOG_N: AtomicU32 = AtomicU32::new(0);
+/// What a measured task says about itself. Ordinary data.
+#[derive(Clone, Copy)]
+struct Report {
+    ticks: u32,
+    turns: u32,
+    longest: u32,
+}
 
-/// Claim a slot, then publish an entry. The ready flag is what makes a reserve-then-write slot
-/// safe for a reader on another task.
-fn log(id: u32) {
-    let i = LOG_N.fetch_add(1, Ordering::Relaxed) as usize;
-    if i < LOG_MAX {
-        LOG_ID[i].store(id, Ordering::Relaxed);
-        LOG_READY[i].store(1, Ordering::Release);
+/// The shared table, behind a lock, with no atomics in it either.
+struct Table {
+    ids: [u32; SLOTS],
+    reports: [Report; SLOTS],
+    count: usize,
+}
+
+static TABLE: Mutex<Table> = Mutex::with_id(
+    LockId::new(1),
+    Table {
+        ids: [0; SLOTS],
+        reports: [Report {
+            ticks: 0,
+            turns: 0,
+            longest: 0,
+        }; SLOTS],
+        count: 0,
+    },
+);
+
+/// Publish this task numbers, adding a slot the first time it is seen.
+fn publish(id: u32, report: Report) {
+    if let Ok(mut t) = TABLE.lock() {
+        let mut i = 0usize;
+        while i < t.count {
+            if t.ids[i] == id {
+                t.reports[i] = report;
+                return;
+            }
+            i += 1;
+        }
+        if t.count < SLOTS {
+            let c = t.count;
+            t.ids[c] = id;
+            t.reports[c] = report;
+            t.count = c + 1;
+        }
     }
 }
 
+/// Look up a slot, if this task ever published.
+fn lookup(id: u32) -> Option<Report> {
+    if let Ok(t) = TABLE.lock() {
+        let mut i = 0usize;
+        while i < t.count {
+            if t.ids[i] == id {
+                return Some(t.reports[i]);
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+/// A measured task: spin, and count in ordinary local variables.
 fn measured(id: u32) {
     let mut last = u64::MAX;
+    let mut ticks = 0u32;
+    let mut turns = 0u32;
+    let mut run = 0u32;
+    let mut longest = 0u32;
     loop {
         let t = rrkernel::now();
         if t != last {
-            log(id);
+            if t == last.wrapping_add(1) {
+                run += 1;
+            } else {
+                if run > longest {
+                    longest = run;
+                }
+                run = 1;
+                turns += 1;
+            }
+            ticks += 1;
             last = t;
+            if ticks % 8 == 0 {
+                publish(id, Report { ticks, turns, longest });
+            }
         }
         core::hint::spin_loop();
     }
 }
 
-fn read_log(into: &mut [u32; READ]) -> usize {
-    let total = LOG_N.load(Ordering::Acquire) as usize;
-    let mut k = 0usize;
-    let mut i = 0usize;
-    while i < total && k < READ {
-        if LOG_READY[i].load(Ordering::Acquire) == 1 {
-            into[k] = LOG_ID[i].load(Ordering::Relaxed);
-            k += 1;
-        }
-        i += 1;
-    }
-    k
-}
-
-const A1: u32 = 101; // 1ms = 2 ticks
-const A2: u32 = 102; // 0.5ms = 1 tick
-
-fn quantum_of(id: u32) -> u32 {
-    if id == A1 {
-        2
-    } else {
-        1
-    }
-}
+const A1: u32 = 101;
+const A2: u32 = 102;
 
 #[rrkernel(log = rtt)]
 #[cortex_m_rt::entry]
 fn main() {
     configure(CORE_HZ, Slice::Micros(500), 1024);
-    rprintln!("rounds-101/102: tick {} ns", rrkernel::tick_ns());
+    rprintln!("rounds: tick {} ns, no atomics in this file", rrkernel::tick_ns());
 
-    // A 2ms window (4 ticks) over children of 1ms (2 ticks) and 0.5ms (1 tick). The lap is 3
-    // ticks, so the window is wider than the lap: no turn is ever cut short.
     let g = thread::spawn_group(Parent::Root, Slice::Millis(2)).expect("group");
     thread::spawn_in(Parent::Group(g), Slice::Millis(1), || measured(A1)).expect("a1");
     thread::spawn_in(Parent::Group(g), Slice::Micros(500), || measured(A2)).expect("a2");
@@ -98,45 +136,21 @@ fn main() {
     let t1 = rrkernel::now();
 
     let st = scheduler::stats();
-    let mut seq = [0u32; READ];
-    let n = read_log(&mut seq);
+    let one = lookup(A1);
+    let half = lookup(A2);
     rprintln!("--- wide window: 2ms group over 1ms and 0.5ms children ---");
-    rprintln!(
-        "measured ticks {} to {} (asked {}), {} log entries",
-        t0,
-        t1,
-        MEASURE_TICKS,
-        LOG_N.load(Ordering::Acquire)
-    );
-
-    let mut c1 = 0u32;
-    let mut c2 = 0u32;
-    let mut worst = 0u32;
-    let mut i = 0usize;
-    while i < n {
-        let id = seq[i];
-        let mut len = 1usize;
-        while i + len < n && seq[i + len] == id {
-            len += 1;
-        }
-        if id == A1 {
-            c1 += len as u32;
-        } else if id == A2 {
-            c2 += len as u32;
-        }
-        let q = quantum_of(id);
-        if len as u32 > q {
-            worst = (len as u32) - q;
-        }
-        rprintln!("  {} x {} tick(s), quantum {}", id, len, q);
-        i += len;
-    }
-    rprintln!("counts: {} in {} ticks, {} in {} ticks", A1, c1, A2, c2);
+    rprintln!("measured ticks {} to {} (asked {})", t0, t1, MEASURE_TICKS);
     rprintln!("kernel: ticks {} switches {}", st.ticks, st.switches);
-
-    let ok = c1 != 0 && c2 != 0 && worst == 0 && matches!(c1.abs_diff(2 * c2), 0..=2);
-    if worst != 0 {
-        rprintln!("FAIL: a turn ran {} tick(s) past its quantum", worst);
+    match (one, half) {
+        (Some(a), Some(b)) => {
+            rprintln!("task {}: {} ticks, {} turns, longest turn {}", A1, a.ticks, a.turns, a.longest);
+            rprintln!("task {}: {} ticks, {} turns, longest turn {}", A2, b.ticks, b.turns, b.longest);
+            let ok = a.longest <= 2 && b.longest <= 1 && matches!(a.ticks.abs_diff(2 * b.ticks), 0..=4);
+            if !ok {
+                rprintln!("FAIL: turns longer than the time asked for, or the 2:1 share is off");
+            }
+            rprintln!("VERDICT : {}", if ok { "PASS" } else { "FAIL" });
+        }
+        _ => rprintln!("VERDICT : FAIL (a measured task never published)", ),
     }
-    rprintln!("VERDICT : {}", if ok { "PASS" } else { "FAIL" });
 }

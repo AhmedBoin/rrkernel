@@ -1,147 +1,151 @@
-//! Phase: a window *narrower* than the lap. A 3ms group over children of 1.5ms, 2ms and 4ms.
+//! A 3ms group over children of 1.5ms, 2ms and 4ms, measured on the board with no atomics.
 //!
 //! ```text
 //! cd examples/cortex-m-bluepill
 //! cargo run --release --bin rounds_cut
 //! ```
 //!
-//! At a 500us tick that is a 6-tick window over children of 3, 4 and 8 ticks, so the window is
-//! narrower than the 15-tick lap: every window cuts a turn short and the next window resumes it
-//! with exactly the time it had left. The runs printed below are that contract, on the board.
-//!
-//! Every measured task spins -- a task that sleeps is not measuring its own turn -- and logs one
-//! entry for each tick it sees change while it holds the CPU. Task 0 sleeps through the
-//! measurement, then reads the log back and checks it.
+//! At a 500us tick the window is 6 ticks over children of 3, 4 and 8, so it is narrower than the
+//! 15-tick lap: every window cuts a turn short and the next window resumes it with exactly the
+//! time it had left. Each task counts only in its own variables and publishes every eighth tick
+//! through a lock, so nothing is shared in the hot path and nothing is atomic.
 
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicU32, Ordering};
 use rrkernel::rrkernel;
+use rrkernel::sync::{LockId, Mutex};
 use rrkernel::thread::{self, Parent};
 use rrkernel::{configure, scheduler, Slice};
 use rtt_target::rprintln;
 
 const CORE_HZ: u32 = 8_000_000;
-const LOG_MAX: usize = 128;
 const MEASURE_TICKS: u64 = 48;
-const READ: usize = 36;
+const SLOTS: usize = 4;
 
-const B1: u32 = 201; // 1.5ms = 3 ticks
-const B2: u32 = 202; // 2ms   = 4 ticks
-const B3: u32 = 203; // 4ms   = 8 ticks
+#[derive(Clone, Copy)]
+struct Report {
+    ticks: u32,
+    turns: u32,
+    longest: u32,
+}
 
-static LOG_ID: [AtomicU32; LOG_MAX] = [const { AtomicU32::new(0) }; LOG_MAX];
-static LOG_READY: [AtomicU32; LOG_MAX] = [const { AtomicU32::new(0) }; LOG_MAX];
-static LOG_N: AtomicU32 = AtomicU32::new(0);
+struct Table {
+    ids: [u32; SLOTS],
+    reports: [Report; SLOTS],
+    count: usize,
+}
 
-fn log(id: u32) {
-    let i = LOG_N.fetch_add(1, Ordering::Relaxed) as usize;
-    if i < LOG_MAX {
-        LOG_ID[i].store(id, Ordering::Relaxed);
-        LOG_READY[i].store(1, Ordering::Release);
+static TABLE: Mutex<Table> = Mutex::with_id(
+    LockId::new(1),
+    Table {
+        ids: [0; SLOTS],
+        reports: [Report {
+            ticks: 0,
+            turns: 0,
+            longest: 0,
+        }; SLOTS],
+        count: 0,
+    },
+);
+
+fn publish(id: u32, report: Report) {
+    if let Ok(mut t) = TABLE.lock() {
+        let mut i = 0usize;
+        while i < t.count {
+            if t.ids[i] == id {
+                t.reports[i] = report;
+                return;
+            }
+            i += 1;
+        }
+        if t.count < SLOTS {
+            let c = t.count;
+            t.ids[c] = id;
+            t.reports[c] = report;
+            t.count = c + 1;
+        }
     }
+}
+
+fn lookup(id: u32) -> Option<Report> {
+    if let Ok(t) = TABLE.lock() {
+        let mut i = 0usize;
+        while i < t.count {
+            if t.ids[i] == id {
+                return Some(t.reports[i]);
+            }
+            i += 1;
+        }
+    }
+    None
 }
 
 fn measured(id: u32) {
     let mut last = u64::MAX;
+    let mut ticks = 0u32;
+    let mut turns = 0u32;
+    let mut run = 0u32;
+    let mut longest = 0u32;
     loop {
         let t = rrkernel::now();
         if t != last {
-            log(id);
+            if t == last.wrapping_add(1) {
+                run += 1;
+            } else {
+                if run > longest {
+                    longest = run;
+                }
+                run = 1;
+                turns += 1;
+            }
+            ticks += 1;
             last = t;
+            if ticks % 8 == 0 {
+                publish(id, Report { ticks, turns, longest });
+            }
         }
         core::hint::spin_loop();
     }
 }
 
-fn read_log(into: &mut [u32; READ]) -> usize {
-    let total = LOG_N.load(Ordering::Acquire) as usize;
-    let mut k = 0usize;
-    let mut i = 0usize;
-    while i < total && k < READ {
-        if LOG_READY[i].load(Ordering::Acquire) == 1 {
-            into[k] = LOG_ID[i].load(Ordering::Relaxed);
-            k += 1;
-        }
-        i += 1;
-    }
-    k
-}
-
-fn quantum_of(id: u32) -> u32 {
-    match id {
-        B1 => 3,
-        B2 => 4,
-        B3 => 8,
-        _ => 1,
-    }
-}
+const B1: u32 = 201;
+const B2: u32 = 202;
+const B3: u32 = 203;
 
 #[rrkernel(log = rtt)]
 #[cortex_m_rt::entry]
 fn main() {
     configure(CORE_HZ, Slice::Micros(500), 1024);
-    rprintln!("rounds-201/202/203: tick {} ns", rrkernel::tick_ns());
+    rprintln!("rounds_cut: tick {} ns, no atomics in this file", rrkernel::tick_ns());
 
     let g = thread::spawn_group(Parent::Root, Slice::Millis(3)).expect("group");
     thread::spawn_in(Parent::Group(g), Slice::Micros(1500), || measured(B1)).expect("b1");
     thread::spawn_in(Parent::Group(g), Slice::Millis(2), || measured(B2)).expect("b2");
     thread::spawn_in(Parent::Group(g), Slice::Millis(4), || measured(B3)).expect("b3");
 
-    let t0 = rrkernel::now();
     rrkernel::sleep_until(scheduler::deadline_after_ticks(MEASURE_TICKS));
-    let t1 = rrkernel::now();
-
     let st = scheduler::stats();
-    let mut seq = [0u32; READ];
-    let n = read_log(&mut seq);
     rprintln!("--- narrow window: 3ms group over 1.5ms, 2ms and 4ms children ---");
-    rprintln!(
-        "measured ticks {} to {} (asked {}), {} log entries",
-        t0,
-        t1,
-        MEASURE_TICKS,
-        LOG_N.load(Ordering::Acquire)
-    );
-
-    let mut spent = [0u32; 3];
-    let mut worst = 0u32;
-    let mut i = 0usize;
-    while i < n {
-        let id = seq[i];
-        let mut len = 1usize;
-        while i + len < n && seq[i + len] == id {
-            len += 1;
-        }
-        let q = quantum_of(id);
-        if len as u32 > q {
-            worst = (len as u32) - q;
-        }
-        if id == B1 {
-            spent[0] += len as u32;
-        } else if id == B2 {
-            spent[1] += len as u32;
-        } else if id == B3 {
-            spent[2] += len as u32;
-        }
-        rprintln!("  {} x {} tick(s), quantum {}", id, len, q);
-        i += len;
-    }
-    rprintln!(
-        "spent: {} {} ticks, {} {} ticks, {} {} ticks",
-        B1,
-        spent[0],
-        B2,
-        spent[1],
-        B3,
-        spent[2]
-    );
     rprintln!("kernel: ticks {} switches {}", st.ticks, st.switches);
-
-    let ok = spent[0] != 0 && spent[1] != 0 && spent[2] != 0 && worst == 0;
-    if worst != 0 {
-        rprintln!("FAIL: a turn ran {} tick(s) past its quantum", worst);
+    let mut ok = true;
+    let quanta = [(B1, 3u32), (B2, 4), (B3, 8)];
+    for (id, q) in quanta {
+        match lookup(id) {
+            Some(r) => {
+                rprintln!("task {}: {} ticks, {} turns, longest turn {} of {}", id, r.ticks, r.turns, r.longest, q);
+                if r.longest > q || r.ticks == 0 {
+                    ok = false;
+                }
+            }
+            None => {
+                rprintln!("task {} never published", id);
+                ok = false;
+            }
+        }
+    }
+    if !ok {
+        rprintln!("FAIL: a task was starved, or took longer than the time it asked for");
     }
     rprintln!("VERDICT : {}", if ok { "PASS" } else { "FAIL" });
 }
