@@ -84,9 +84,13 @@ fn leaf(name: &'static str, runs: &AtomicU32, late: &AtomicU32) {
     }
 }
 
-#[rrkernel(log = rtt)]
+#[rrkernel]
 #[cortex_m_rt::entry]
 fn main() {
+    // RTT belongs to the example, not to the kernel: the terminal is set up here, and the kernel is
+    // only handed a log sink so panics still reach it. Leave these lines out on a board with no probe.
+    rtt_target::rtt_init_print!();
+    rrkernel::log_with(|args| rprintln!("{}", args));
     // The first line out, before anything else: if this never appears, nothing after it ran and
     // the fault is in startup or `configure` rather than in the tree.
     rprintln!("nested: starting");

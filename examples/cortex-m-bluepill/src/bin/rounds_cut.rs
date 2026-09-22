@@ -120,9 +120,13 @@ const B1: u32 = 201;
 const B2: u32 = 202;
 const B3: u32 = 203;
 
-#[rrkernel(log = rtt)]
+#[rrkernel]
 #[cortex_m_rt::entry]
 fn main() {
+    // RTT belongs to the example, not to the kernel: the terminal is set up here, and the kernel is
+    // only handed a log sink so panics still reach it. Leave these lines out on a board with no probe.
+    rtt_target::rtt_init_print!();
+    rrkernel::log_with(|args| rprintln!("{}", args));
     configure(CORE_HZ, Slice::Micros(500), 1024);
     rprintln!(
         "rounds_cut: tick {} ns, no atomics in this file",

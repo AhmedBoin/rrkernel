@@ -52,9 +52,13 @@ fn cycles() -> u32 {
     unsafe { core::ptr::read_volatile(0xE000_1004 as *const u32) }
 }
 
-#[rrkernel(log = rtt)]
+#[rrkernel]
 #[cortex_m_rt::entry]
 fn main() {
+    // RTT belongs to the example, not to the kernel: the terminal is set up here, and the kernel is
+    // only handed a log sink so panics still reach it. Leave these lines out on a board with no probe.
+    rtt_target::rtt_init_print!();
+    rrkernel::log_with(|args| rprintln!("{}", args));
     // 1 ms slices, 1 KiB per task: the fidelity workload runs several at once, and the default
     // 16 KiB arena holds the TCBs, closures and these stacks.
     configure(CORE_HZ, Slice::Millis(1), 1024);

@@ -1,14 +1,3 @@
-//! rrkernel on an STM32F103C8 "Blue Pill" — the entire application.
-//!
-//! ```text
-//! cd examples/cortex-m-bluepill
-//! cargo run
-//! ```
-//!
-//! Everything else is handled for you: the entry point, the kernel's configuration, the
-//! vector-table wiring, the fault and panic handlers, and — because of `log = rtt` — the
-//! RTT terminal, its guard and the log sink.
-
 #![no_std]
 #![no_main]
 
@@ -19,13 +8,9 @@ use rtt_target::rprintln;
 /// The core clock: the one number the kernel cannot work out for itself.
 const CORE_HZ: u32 = 8_000_000;
 
-#[rrkernel]
+#[rrkernel(log = rtt)]
 #[cortex_m_rt::entry]
 fn main() {
-    // RTT belongs to the example, not to the kernel: the terminal is set up here, and the kernel is
-    // only handed a log sink so panics still reach it. Leave these lines out on a board with no probe.
-    rtt_target::rtt_init_print!();
-    rrkernel::log_with(|args| rprintln!("{}", args));
     // The scheduler: core clock, slice, per-task stack. This is the timing contract.
     configure(CORE_HZ, Slice::Millis(1), 1024);
 
@@ -45,48 +30,6 @@ fn main() {
     thread::spawn(|| periodic("A", 100, 0));
     thread::spawn(|| periodic("B", 250, 0));
     thread::spawn(|| periodic("C", 500, 4));
-
-    // `main` IS task 0 — no wrapper, no `main_body`, no shutdown. `sleep` takes a
-    // duration in whatever unit reads best; the kernel records the deadline against its
-    // global tick and switches this task away until it is reached.
-    let start = rrkernel::now();
-    rrkernel::sleep(Duration::from_millis(2500));
-    let slept = rrkernel::now().wrapping_sub(start);
-
-    let st = rrkernel::scheduler::stats();
-    let mut ring_len = 0u32;
-    let mut dead = 0u32;
-    rrkernel::scheduler::for_each_task(|t| {
-        ring_len += 1;
-        if t.state == rrkernel::TaskState::Dead {
-            dead += 1;
-        }
-    });
-
-    rprintln!("--- report ---");
-    rprintln!("slept    : {} ticks (asked 2500 ms)", slept);
-    rprintln!(
-        "threads  : total {} active {} reclaimed {}",
-        st.total_threads,
-        st.active_threads,
-        st.reclaimed
-    );
-    rprintln!("ticks    : {} switches {}", st.ticks, st.switches);
-    rprintln!(
-        "accuracy : worst switch {} cycles (DWT), worst period error {} ns",
-        st.worst_latency,
-        st.worst_period_error_ns
-    );
-    rprintln!("ring     : {} nodes, {} dead", ring_len, dead);
-
-    let ok = st.ticks > 0
-        && st.switches > 0
-        && ring_len as usize == st.active_threads
-        && dead == 0
-        && slept >= 2500;
-    rprintln!("VERDICT  : {}", if ok { "PASS" } else { "FAIL" });
-    // Returning here ends task 0: the macro's `exit_main()` unlinks it, and the periodic
-    // threads above keep running.
 }
 
 /// Print `[name] ...` every `period_ms`, `prints` times (`0` = forever).

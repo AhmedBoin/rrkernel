@@ -128,9 +128,14 @@ fn measured(id: u32) {
 const A1: u32 = 101;
 const A2: u32 = 102;
 
-#[rrkernel(log = rtt)]
+#[rrkernel]
 #[cortex_m_rt::entry]
 fn main() {
+    // RTT is the example business, not the kernel: the terminal is set up here and the kernel is
+    // handed a log sink so panics and faults still reach the terminal. Nothing in rrkernel knows
+    // what RTT is, and a board without a debug probe simply leaves these two lines out.
+    rtt_target::rtt_init_print!();
+    rrkernel::log_with(|args| rprintln!("{}", args));
     configure(CORE_HZ, Slice::Micros(500), 1024);
     rprintln!(
         "rounds: tick {} ns, no atomics in this file",

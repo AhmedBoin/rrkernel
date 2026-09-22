@@ -37,9 +37,13 @@ static PARK_WAKES: AtomicU32 = AtomicU32::new(0);
 static ASYNC_DONE: AtomicU32 = AtomicU32::new(0);
 static STOP: AtomicU32 = AtomicU32::new(0);
 
-#[rrkernel(log = rtt)]
+#[rrkernel]
 #[cortex_m_rt::entry]
 fn main() {
+    // RTT belongs to the example, not to the kernel: the terminal is set up here, and the kernel is
+    // only handed a log sink so panics still reach it. Leave these lines out on a board with no probe.
+    rtt_target::rtt_init_print!();
+    rrkernel::log_with(|args| rprintln!("{}", args));
     configure(CORE_HZ, Slice::Millis(1), 1024);
     rprintln!("layers: slice {} ns", rrkernel::tick_ns());
 
