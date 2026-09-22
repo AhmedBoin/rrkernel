@@ -56,6 +56,10 @@ use core::ptr::{read_volatile, write_volatile};
 const SYST_CSR: u32 = 0xE000_E010; // control/status
 const SYST_RVR: u32 = 0xE000_E014; // reload value
 const SYST_CVR: u32 = 0xE000_E018; // current value (writing any value clears it)
+/// Log every Nth tick through the application sink, for diagnosing a system that stops making
+/// progress. Zero (the shipped value) means silence.
+const TRACE_EVERY: u64 = 0;
+
 const SHPR3: u32 = 0xE000_ED20; // SysTick + PendSV priorities
 const ICSR: u32 = 0xE000_ED04; // interrupt control/state (PENDSVSET)
 const FPCCR: u32 = 0xE000_EF34; // floating-point context control
@@ -187,6 +191,13 @@ pub unsafe extern "C" fn SysTick_Handler() {
     // `try_lock_for` never times out, and every `ticks > 0` invariant fails — while the
     // machine looks perfectly healthy, because the switches still happen.
     unsafe { crate::scheduler::on_tick() };
+    // Temporary diagnostic, off unless TRACE_EVERY is set: report the tick through the
+    // application log sink. If these lines stop while a sleeper waits, the tick is not running
+    // while the CPU idles; if they keep coming while the sleeper stays asleep, the wake is what
+    // fails. It is a two-run experiment that needs no probe-side tooling.
+    if TRACE_EVERY != 0 && (*KERNEL.ticks.get()).is_multiple_of(TRACE_EVERY) {
+        crate::app_support::log_fmt(format_args!("rrkernel: tick {}", *KERNEL.ticks.get()));
+    }
     wr(ICSR, ICSR_PENDSVSET);
 }
 
