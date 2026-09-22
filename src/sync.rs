@@ -178,7 +178,7 @@ impl<T> Mutex<T> {
             return Err(LockError::NotRunning);
         }
         let _g = self.header.state.lock();
-        let owner = self.header.owner.load(Ordering::Relaxed);
+        let owner = self.header.owner.load(Ordering::Acquire);
         if owner == me {
             return Err(LockError::AlreadyOwnedBySelf);
         }
@@ -188,7 +188,7 @@ impl<T> Mutex<T> {
         // Free: check the ordering rule *before* taking it, so a refused acquisition
         // leaves nothing behind.
         unsafe { held_check_order(self.header.id)? };
-        self.header.owner.store(me, Ordering::Relaxed);
+        // Release: the data this task is about to touch must become visible before anyone\n        // else can observe that the lock was ever free. A Relaxed store here gave the compiler\n        // leave to read the protected data *before* the handoff, which showed up as an\n        // intermittent, optimisation-only failure on the board.\n        self.header.owner.store(me, Ordering::Release);
         unsafe { held_push(self.header.id) };
         Ok(true)
     }
@@ -334,7 +334,7 @@ impl<T> Drop for MutexGuard<'_, T> {
 fn release_shim(header: &MutexHeader) {
     {
         let _g = header.state.lock();
-        header.owner.store(0, Ordering::Relaxed);
+        // Release: everything written under the lock happens-before this store, so the next\n        // acquirer (whose check uses an Acquire load) sees it.\n        header.owner.store(0, Ordering::Release);
     }
     unsafe { held_remove(header.id) };
     // Wake every task sleeping on this lock. The context switch that follows is O(1);
