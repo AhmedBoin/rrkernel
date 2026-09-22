@@ -25,6 +25,9 @@ pub struct CriticalGuard {
 impl Drop for CriticalGuard {
     #[inline]
     fn drop(&mut self) {
+        // Fence *before* re-enabling interrupts: everything written inside the section must
+        // have landed before the ISR can run again.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // SAFETY: paired with the `enter` below, exactly once.
         unsafe { crate::arch::critical_exit(self.token) }
     }
@@ -33,6 +36,15 @@ impl Drop for CriticalGuard {
 /// Enter a critical section. Nestable on every backend.
 #[inline]
 pub fn enter() -> CriticalGuard {
+    // A compiler barrier *before* the mask, and one *after* it in `Drop`.
+    //
+    // The per-backend entry assembly carries `nomem`, which is accurate - `cpsid i` really does
+    // not touch memory - and that accuracy is exactly what removes the barrier this section
+    // exists to provide. Without these fences the optimiser may sink a store past the unmask,
+    // so a task can publish its state and enable interrupts in the wrong order; the tick ISR
+    // then sees a stale state, misses the wake, and the system wedges the first time a task
+    // blocks. That is a release-only, timing-dependent failure, which is what it looked like.
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     // SAFETY: the token is opaque and only consumed by the matching exit.
     let token = unsafe { crate::arch::critical_enter() };
     CriticalGuard { token }
