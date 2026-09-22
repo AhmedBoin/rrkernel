@@ -2006,7 +2006,6 @@ mod nested_tests {
                 // the subtree keeps running and every budget is positive again — rather than
                 // the exact per-tick arithmetic, which drain-then-dispatch ordering makes
                 // easy to mis-guess (as two of my earlier expectations in this file were).
-                let _ = tick();
                 assert_eq!(
                     (*tick()).id,
                     72,
@@ -2426,6 +2425,49 @@ mod nested_tests {
                     rs,
                     lp + nt,
                     got
+                );
+            }
+            // --- one task: it blocks, and a tick must wake it and run it ---------------
+            {
+                // The shape the board reduced this to: configure, then a single task that
+                // sleeps, and nothing else runnable at all. If this passes and the firmware
+                // still hangs, the scheduler is not at fault and the port idle path is.
+                let root = node(NodeKind::Group, u32::MAX, 0);
+                let only = node(NodeKind::Leaf, 1, 950);
+                attach(root, &[only]);
+                install(root, only);
+                // Production starts task 0 as Running (init does); the harness builds Ready.
+                (*only).state = TaskState::Running;
+                assert_eq!(
+                    (*only).state,
+                    TaskState::Running,
+                    "the only task should be running"
+                );
+                (*only).state = TaskState::Blocked;
+                (*only).block_deadline = *KERNEL.ticks.get() + 5;
+                assert_eq!(
+                    (*only).remaining_cycles,
+                    1,
+                    "it blocks mid-quantum, as the board case does"
+                );
+                for _ in 0..4 {
+                    let _ = tick();
+                    assert_eq!(
+                        (*only).state,
+                        TaskState::Blocked,
+                        "it must stay asleep until its deadline"
+                    );
+                }
+                let who = tick(); // this one reaches the deadline
+                assert_eq!(
+                    (*only).state,
+                    TaskState::Ready,
+                    "the deadline must wake it (no switch, so it stays Ready)"
+                );
+                assert_eq!(
+                    (*who).id,
+                    950,
+                    "and it must be dispatched again with an empty ring"
                 );
             }
         }

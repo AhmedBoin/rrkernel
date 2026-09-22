@@ -29,7 +29,6 @@ unsafe fn pre_init() {
     core::ptr::write_volatile(BREADCRUMB, 0x11);
 }
 
-
 #[rrkernel]
 #[cortex_m_rt::entry]
 fn main() -> ! {

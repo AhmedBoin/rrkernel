@@ -29,7 +29,6 @@ unsafe fn pre_init() {
     core::ptr::write_volatile(BREADCRUMB, 0x11);
 }
 
-
 #[rrkernel]
 #[cortex_m_rt::entry]
 fn main() -> ! {
@@ -44,7 +43,10 @@ fn main() -> ! {
     rprintln!("life5: kernel configured, adding one sleeping child while main spins");
     thread::spawn(|| loop {
         rrkernel::sleep_ms(10);
-        rprintln!("life5: the sleeping child woke at {} ticks", rrkernel::now());
+        rprintln!(
+            "life5: the sleeping child woke at {} ticks",
+            rrkernel::now()
+        );
     });
     rprintln!("life5: child spawned, main now spinning");
     rprintln!("life: startup and RTT both work");

@@ -58,7 +58,7 @@ const SYST_RVR: u32 = 0xE000_E014; // reload value
 const SYST_CVR: u32 = 0xE000_E018; // current value (writing any value clears it)
 /// Log every Nth tick through the application sink, for diagnosing a system that stops making
 /// progress. Zero (the shipped value) means silence.
-const TRACE_EVERY: u64 = 0;
+const TRACE_EVERY: u64 = 100;
 
 const SHPR3: u32 = 0xE000_ED20; // SysTick + PendSV priorities
 const ICSR: u32 = 0xE000_ED04; // interrupt control/state (PENDSVSET)

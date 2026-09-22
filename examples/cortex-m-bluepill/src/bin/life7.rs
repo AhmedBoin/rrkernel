@@ -29,7 +29,6 @@ unsafe fn pre_init() {
     core::ptr::write_volatile(BREADCRUMB, 0x11);
 }
 
-
 #[rrkernel]
 #[cortex_m_rt::entry]
 fn main() -> ! {
@@ -41,7 +40,10 @@ fn main() -> ! {
     rprintln!("life7: configure done; a second task will sleep 200ms and then spin");
     thread::spawn(|| {
         rrkernel::sleep_ms(200);
-        rprintln!("life7: the SECOND task woke at {} ticks - so wakes work while idling", rrkernel::now());
+        rprintln!(
+            "life7: the SECOND task woke at {} ticks - so wakes work while idling",
+            rrkernel::now()
+        );
         loop {
             core::hint::spin_loop();
         }

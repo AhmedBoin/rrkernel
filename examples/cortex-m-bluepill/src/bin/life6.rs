@@ -29,7 +29,6 @@ unsafe fn pre_init() {
     core::ptr::write_volatile(BREADCRUMB, 0x11);
 }
 
-
 #[rrkernel]
 #[cortex_m_rt::entry]
 fn main() -> ! {
@@ -37,6 +36,8 @@ fn main() -> ! {
     // The critical-section implementation has to be linked, or rtt-target fails at link time.
     let _ = cortex_m::interrupt::free(|_cs| ());
     rtt_target::rtt_init_print!();
+    // The kernel reports through this sink, which is where the tick trace will appear.
+    rrkernel::log_with(|args| rprintln!("{}", args));
     crumb(0x33);
     rprintln!("life6: RTT is up, one task only, and it will sleep");
     configure(CORE_HZ, Slice::Millis(1), 1024);
