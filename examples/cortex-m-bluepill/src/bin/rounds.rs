@@ -111,7 +111,14 @@ fn measured(id: u32) {
             ticks += 1;
             last = t;
             if ticks % 8 == 0 {
-                publish(id, Report { ticks, turns, longest });
+                publish(
+                    id,
+                    Report {
+                        ticks,
+                        turns,
+                        longest,
+                    },
+                );
             }
         }
         core::hint::spin_loop();
@@ -125,7 +132,10 @@ const A2: u32 = 102;
 #[cortex_m_rt::entry]
 fn main() {
     configure(CORE_HZ, Slice::Micros(500), 1024);
-    rprintln!("rounds: tick {} ns, no atomics in this file", rrkernel::tick_ns());
+    rprintln!(
+        "rounds: tick {} ns, no atomics in this file",
+        rrkernel::tick_ns()
+    );
 
     let g = thread::spawn_group(Parent::Root, Slice::Millis(2)).expect("group");
     thread::spawn_in(Parent::Group(g), Slice::Millis(1), || measured(A1)).expect("a1");
@@ -143,14 +153,27 @@ fn main() {
     rprintln!("kernel: ticks {} switches {}", st.ticks, st.switches);
     match (one, half) {
         (Some(a), Some(b)) => {
-            rprintln!("task {}: {} ticks, {} turns, longest turn {}", A1, a.ticks, a.turns, a.longest);
-            rprintln!("task {}: {} ticks, {} turns, longest turn {}", A2, b.ticks, b.turns, b.longest);
-            let ok = a.longest <= 2 && b.longest <= 1 && matches!(a.ticks.abs_diff(2 * b.ticks), 0..=4);
+            rprintln!(
+                "task {}: {} ticks, {} turns, longest turn {}",
+                A1,
+                a.ticks,
+                a.turns,
+                a.longest
+            );
+            rprintln!(
+                "task {}: {} ticks, {} turns, longest turn {}",
+                A2,
+                b.ticks,
+                b.turns,
+                b.longest
+            );
+            let ok =
+                a.longest <= 2 && b.longest <= 1 && matches!(a.ticks.abs_diff(2 * b.ticks), 0..=4);
             if !ok {
                 rprintln!("FAIL: turns longer than the time asked for, or the 2:1 share is off");
             }
             rprintln!("VERDICT : {}", if ok { "PASS" } else { "FAIL" });
         }
-        _ => rprintln!("VERDICT : FAIL (a measured task never published)", ),
+        _ => rprintln!("VERDICT : FAIL (a measured task never published)",),
     }
 }

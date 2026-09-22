@@ -700,13 +700,28 @@ unsafe fn pick_next_leaf(cur: *mut TaskControlBlock) -> *mut TaskControlBlock {
     // the first child, 0 to the second. A lone child is unaffected -- advancing from it lands
     // back on itself -- and a child preempted with time left keeps its turn, because its
     // remaining quantum is not zero.
-    if z != cur && (*cur).remaining_cycles == 0 {
-        let parent = (*cur).parent;
-        if !parent.is_null() {
-            let next = crate::ring::next_runnable(cur);
-            if !next.is_null() && (*next).parent == parent {
-                (*parent).current_child = next;
+    // Every node on the running path whose own quantum is spent has had its turn -- even when
+    // what ended the visit was an ancestor window closing on the same tick. Move each such
+    // node parent cursor past it, so that re-entering the parent does not hand the same node a
+    // fresh turn while its sibling waits for ever. The node can be a leaf or a group: a group
+    // that spent its window must also lose its place, which is how a leaf sitting next to a
+    // group inside a group gets scheduled at all.
+    {
+        let limit = walk_limit();
+        let mut guard = 0u32;
+        let mut n = cur;
+        while !n.is_null() && n != z && guard <= limit {
+            guard += 1;
+            if (*n).remaining_cycles == 0 {
+                let parent = (*n).parent;
+                if !parent.is_null() {
+                    let next = crate::ring::next_runnable(n);
+                    if !next.is_null() && (*next).parent == parent {
+                        (*parent).current_child = next;
+                    }
+                }
             }
+            n = (*n).parent;
         }
     }
     if z == root {

@@ -102,7 +102,14 @@ fn measured(id: u32) {
             ticks += 1;
             last = t;
             if ticks % 8 == 0 {
-                publish(id, Report { ticks, turns, longest });
+                publish(
+                    id,
+                    Report {
+                        ticks,
+                        turns,
+                        longest,
+                    },
+                );
             }
         }
         core::hint::spin_loop();
@@ -117,7 +124,10 @@ const B3: u32 = 203;
 #[cortex_m_rt::entry]
 fn main() {
     configure(CORE_HZ, Slice::Micros(500), 1024);
-    rprintln!("rounds_cut: tick {} ns, no atomics in this file", rrkernel::tick_ns());
+    rprintln!(
+        "rounds_cut: tick {} ns, no atomics in this file",
+        rrkernel::tick_ns()
+    );
 
     let g = thread::spawn_group(Parent::Root, Slice::Millis(3)).expect("group");
     thread::spawn_in(Parent::Group(g), Slice::Micros(1500), || measured(B1)).expect("b1");
@@ -133,7 +143,14 @@ fn main() {
     for (id, q) in quanta {
         match lookup(id) {
             Some(r) => {
-                rprintln!("task {}: {} ticks, {} turns, longest turn {} of {}", id, r.ticks, r.turns, r.longest, q);
+                rprintln!(
+                    "task {}: {} ticks, {} turns, longest turn {} of {}",
+                    id,
+                    r.ticks,
+                    r.turns,
+                    r.longest,
+                    q
+                );
                 if r.longest > q || r.ticks == 0 {
                     ok = false;
                 }
